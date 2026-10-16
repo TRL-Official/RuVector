@@ -51,11 +51,19 @@ function makeCaller() {
   };
 }
 
+// One worker per process, shared by every store opened in it (neon-fs.mjs opens one per file).
+let sharedCall = null;
+
 function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
   const schema = process.env.RVN_SCHEMA || 'rvdirect';
   if (!/^[a-z_][a-z0-9_]*$/.test(schema)) throw new Error(`neon-doc-store: bad schema name ${schema}`);
   const T = `${schema}.rec`;
-  const KEYED = new Set(keyed);
+  // keyed: the top-level objects stored one row per sub-key. '*' = every top-level object whose
+  // values are all objects (generic stores whose shape is not known in advance — neon-fs.mjs).
+  const AUTO = keyed === '*';
+  const KEYED = new Set(AUTO ? [] : keyed);
+  const isKeyed = (key, val) => (KEYED.has(key) && val && typeof val === 'object') || (AUTO && val && typeof val === 'object' && !Array.isArray(val)
+    && Object.keys(val).length > 0 && Object.values(val).every((v) => v && typeof v === 'object'));
   // `lazy` collections (ruvector's memories) are never loaded whole — at real scale the document
   // exceeds Neon's 64 MB HTTP response limit (gate R9). Their rows carry a pgvector column, and
   // recall becomes search() — a query in Neon. Only the newest `window` rows are loaded, and since
@@ -63,27 +71,45 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
   const LAZY = [...lazy];
   const DIM = Number(process.env.RVN_DIM) || 384;
   const WINDOW = Number(process.env.RVN_WINDOW ?? window) || 0;
-  const call = makeCaller();
+  const call = (sharedCall ??= makeCaller());
   let snapshot = new Map(); // `${coll}\u0000${rid}` → JSON of body as loaded/saved
   const stats = { loads: 0, saves: 0, upserts: 0, deletes: 0, ms: 0 };
+
+  let uidN = 0;
+  const uid = () => `${process.pid.toString(36)}${Date.now().toString(36)}${(uidN++).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
 
   function toRows(doc) {
     const rows = [];
     for (const [key, val] of Object.entries(doc)) {
       if (val === undefined) continue;
       if (Array.isArray(val)) {
+        // Elements without an id are identified by content. An element this process LOADED keeps the
+        // row id it came with (first unclaimed row with the same content hash); a NEW element gets a
+        // fresh unique id — so two sessions appending identical-looking entries (a history of
+        // outcomes) both keep theirs, instead of colliding on the same content-derived id.
+        const avail = new Map();
+        for (const k of snapshot.keys()) {
+          const [c, r] = k.split('\u0000');
+          if (c !== key || !r.startsWith('h:')) continue;
+          const h = r.slice(2, 22); (avail.get(h) || avail.set(h, []).get(h)).push(r);
+        }
         const seen = new Map();
         for (const el of val) {
           let rid;
-          // Real stores repeat ids (the live trajectories do), so a repeat gets #n: both copies are kept.
-          const base = el && typeof el === 'object' && (typeof el.id === 'string' || typeof el.id === 'number')
-            ? `id:${el.id}` : `h:${createHash('sha1').update(JSON.stringify(el)).digest('hex').slice(0, 20)}`;
-          const n = (seen.get(base) || 0) + 1; seen.set(base, n);
-          rid = n === 1 ? base : `${base}#${n}`;
+          if (el && typeof el === 'object' && (typeof el.id === 'string' || typeof el.id === 'number')) {
+            // Real stores repeat ids (the live trajectories do), so a repeat gets #n: both copies are kept.
+            const base = `id:${el.id}`;
+            const n = (seen.get(base) || 0) + 1; seen.set(base, n);
+            rid = n === 1 ? base : `${base}#${n}`;
+          } else {
+            const h = createHash('sha1').update(JSON.stringify(el)).digest('hex').slice(0, 20);
+            const mine = avail.get(h);
+            rid = mine && mine.length ? mine.shift() : `h:${h}~${uid()}`;
+          }
           rows.push({ coll: key, rid, body: el, kind: 'a' });
         }
         if (val.length === 0) rows.push({ coll: '_doc', rid: `[]${key}`, body: [], kind: 'e' }); // keep empty arrays
-      } else if (KEYED.has(key) && val && typeof val === 'object') {
+      } else if (isKeyed(key, val)) {
         for (const [k, v] of Object.entries(val)) if (v !== undefined) rows.push({ coll: key, rid: `k:${k}`, body: v, kind: 'o' });
         if (Object.keys(val).length === 0) rows.push({ coll: '_doc', rid: `{}${key}`, body: {}, kind: 'e' });
       } else {
@@ -111,7 +137,9 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
     }
   }
 
-  function load() {
+  // load() also records what this process has SEEN (the snapshot save() diffs against). peek=true reads
+  // without that — for a stat or an existence check, which must not widen what a later save may delete.
+  function load({ peek = false } = {}) {
     const t = Date.now();
     const SELECT = [
       { text: `SELECT coll, rid, body FROM (
@@ -123,11 +151,12 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
     ];
     const [rows] = withTable(() => call(SELECT));
     stats.loads++; stats.ms += Date.now() - t;
-    snapshot = new Map();
+    const seen = new Map();
+    if (!peek) snapshot = seen;
     if (!rows.length) return null; // an empty store: the caller starts from its defaults
     const doc = {};
     for (const { coll, rid, body } of rows) {
-      snapshot.set(`${coll}\u0000${rid}`, JSON.stringify(body));
+      seen.set(`${coll}\u0000${rid}`, JSON.stringify(body));
       if (coll === '_doc') {
         if (rid.startsWith('[]')) { doc[rid.slice(2)] ??= []; continue; }
         if (rid.startsWith('{}')) { doc[rid.slice(2)] ??= {}; continue; }
@@ -244,7 +273,12 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
     clear: (coll) => withTable(() => call([{ text: `DELETE FROM ${T} WHERE store = $1 AND coll = $2`, params: [store, coll] }])),
   };
 
-  return { load, save, search, rows, stats, query: (text, params) => withTable(() => call([{ text, params }])[0]) };
+  // Remove the whole store (a deleted file).
+  function drop() { withTable(() => call([{ text: `DELETE FROM ${T} WHERE store = $1`, params: [store] }])); snapshot = new Map(); }
+  // Does the store hold anything? (one indexed lookup, cheaper than load)
+  function exists() { return withTable(() => call([{ text: `SELECT 1 FROM ${T} WHERE store = $1 LIMIT 1`, params: [store] }]))[0].length > 0; }
+
+  return { load, save, search, rows, drop, exists, stats, query: (text, params) => withTable(() => call([{ text, params }])[0]) };
 }
 
 module.exports = { openDocStore };
