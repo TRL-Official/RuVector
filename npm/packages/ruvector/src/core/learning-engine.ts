@@ -580,7 +580,7 @@ export class LearningEngine {
 
     // Running average reward
     this.rewardHistory.push(reward);
-    if (this.rewardHistory.length > 500) {
+    if (this.rewardHistory.length > (Number(process.env.RUVECTOR_REWARD_HISTORY_MAX) || Infinity)) { /* [uncap] */
       this.rewardHistory.shift();
     }
     stats.avgReward = this.rewardHistory.reduce((a, b) => a + b, 0) / this.rewardHistory.length;
@@ -683,10 +683,10 @@ export class LearningEngine {
       eligibilityTraces,
       actorWeights,
       criticValues,
-      trajectories: this.trajectories.slice(-100),
+      trajectories: this.trajectories.slice(-(Number(process.env.RUVECTOR_LEARNING_TRAJECTORIES_MAX) || Infinity)), /* [uncap] */
       stats,
       configs,
-      rewardHistory: this.rewardHistory.slice(-500),
+      rewardHistory: this.rewardHistory.slice(-(Number(process.env.RUVECTOR_REWARD_HISTORY_MAX) || Infinity)), /* [uncap] */
     };
   }
 

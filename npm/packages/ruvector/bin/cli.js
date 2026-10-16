@@ -8,6 +8,14 @@ const _chalk = require('chalk');
 const chalk = _chalk.default || _chalk;
 const fs = require('fs');
 const path = require('path');
+// [neon-direct] state goes to Neon when RUVECTOR_STORE=neon; caps are opt-in (env), not built in.
+const RVN_ON = process.env.RUVECTOR_STORE === 'neon';
+let _rvn = null;
+const rvn = () => (_rvn ??= require("./neon-doc-store.cjs").openDocStore({
+  store: process.env.RVN_STORE_NAME || 'ruvector-intel', keyed: ["patterns","errors","agents","coEditPatterns","sequences","activeTrajectories","compressedPatterns","dirPatterns","changePatterns"], lazy: ['memories'] }));
+const rvnIsIntel = (p) => RVN_ON && path.basename(p) === 'intelligence.json';
+const RV_MAX_MEMORIES = Number(process.env.RUVECTOR_MAX_MEMORIES) || Infinity;
+const RV_MAX_TRAJECTORIES = Number(process.env.RUVECTOR_MAX_TRAJECTORIES) || Infinity;
 
 // Lazy load ora (spinner) - only needed for commands with progress indicators
 let _oraModule = null;
@@ -3089,6 +3097,7 @@ function sanitizeDimension(value, fallback) {
  * the temp file; the final rename is last-writer-wins.
  */
 function atomicWriteFileSync(filePath, data) {
+  if (rvnIsIntel(filePath)) { rvn().save(JSON.parse(data)); return; } // [neon-direct]
   const dir = path.dirname(filePath);
   const tmp = path.join(dir, `.${path.basename(filePath)}.tmp.${process.pid}.${Date.now()}`);
   try {
@@ -3109,6 +3118,7 @@ function atomicWriteFileSync(filePath, data) {
  * store. Mirrors Intelligence.load()'s corrupt handling.
  */
 function readIntelStoreSafe(dataPath) {
+  if (rvnIsIntel(dataPath)) return rvn().load() || {}; // [neon-direct]
   if (!fs.existsSync(dataPath)) return {};
   try {
     return JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
@@ -3251,9 +3261,10 @@ class Intelligence {
       stats: { total_patterns: 0, total_memories: 0, total_trajectories: 0, total_errors: 0, session_count: 0, last_session: 0 }
     };
     // A missing store is a legitimate fresh start.
-    if (!fs.existsSync(this.intelPath)) return defaults;
+    if (!RVN_ON && !fs.existsSync(this.intelPath)) return defaults; // [neon-direct]
 
     let data;
+    if (RVN_ON) { data = rvn().load(); if (data === null) return defaults; } else // [neon-direct]
     try {
       data = JSON.parse(fs.readFileSync(this.intelPath, 'utf-8'));
     } catch (err) {
@@ -3280,6 +3291,7 @@ class Intelligence {
     const asArray = (v, dflt) => (Array.isArray(v) ? v : dflt);
     const asObject = (v, dflt) => (v && typeof v === 'object' && !Array.isArray(v) ? v : dflt);
     return {
+      ...data, // [neon-direct] keep every key; the sanitized fields below still win
       patterns: asObject(data.patterns, defaults.patterns),
       memories: asArray(data.memories, defaults.memories),
       trajectories: asArray(data.trajectories, defaults.trajectories),
@@ -3312,7 +3324,7 @@ class Intelligence {
       try {
         const engineData = eng.export();
         // Merge engine data with legacy format for compatibility
-        this.data.patterns = {};
+        this.data.patterns = this.data.patterns || {}; // [neon-direct] merge, never wipe
         for (const [state, actions] of Object.entries(engineData.routingPatterns || {})) {
           for (const [action, value] of Object.entries(actions)) {
             this.data.patterns[`${state}|${action}`] = { state, action, q_value: value, visits: 1, last_update: this.now() };
@@ -3328,7 +3340,7 @@ class Intelligence {
       }
     }
 
-    atomicWriteFileSync(this.intelPath, JSON.stringify(this.data, null, 2));
+    if (RVN_ON) rvn().save(this.data); else atomicWriteFileSync(this.intelPath, JSON.stringify(this.data, null, 2)); // [neon-direct]
   }
 
   now() { return Math.floor(Date.now() / 1000); }
@@ -3515,7 +3527,7 @@ class Intelligence {
           metadata,
           timestamp: this.now()
         });
-        if (this.data.memories.length > 5000) this.data.memories.splice(0, 1000);
+        if (this.data.memories.length > RV_MAX_MEMORIES) this.data.memories.splice(0, this.data.memories.length - RV_MAX_MEMORIES); // [neon-direct]
         this.data.stats.total_memories = this.data.memories.length;
         return entry.id;
       }
@@ -3531,7 +3543,7 @@ class Intelligence {
     const guard = this.guardVectorWrite(this.syncWriteProvenance(embedding));
     if (!guard.ok) return null;
     this.data.memories.push({ id, memory_type: memoryType, content, embedding, metadata, timestamp: this.now() });
-    if (this.data.memories.length > 5000) this.data.memories.splice(0, 1000);
+    if (this.data.memories.length > RV_MAX_MEMORIES) this.data.memories.splice(0, this.data.memories.length - RV_MAX_MEMORIES); // [neon-direct]
     this.data.stats.total_memories = this.data.memories.length;
 
     // Also store in engine if already initialized (don't trigger lazy load)
@@ -3581,6 +3593,12 @@ class Intelligence {
   }
 
   async recallAsync(query, topK = 5) {
+    if (RVN_ON && this.engine) { // [neon-direct] the search runs in Neon, over every memory
+      const qe = await this.engine.embedAsync(query);
+      if (typeof this.engine.getActiveProvenance === 'function') this.warnRecallProvenance(this.engine.getActiveProvenance());
+      return rvn().search('memories', Array.from(qe), topK).map(r => ({
+        id: r.id, content: r.content || '', memory_type: r.memory_type || 'general', timestamp: r.timestamp, score: r.score }));
+    }
     if (this.engine) {
       try {
         const results = await this.engine.recall(query, topK);
@@ -3610,6 +3628,7 @@ class Intelligence {
   recall(query, topK) {
     const queryEmbed = this.embed(query);
     this.warnRecallProvenance(this.syncWriteProvenance(queryEmbed));
+    if (RVN_ON) return rvn().search('memories', queryEmbed, topK); // [neon-direct]
     return this.data.memories
       .map(m => ({ score: this.similarity(queryEmbed, m.embedding), memory: m }))
       .sort((a, b) => b.score - a.score).slice(0, topK).map(r => r.memory);
@@ -3690,7 +3709,7 @@ class Intelligence {
     if (!this.data.trajectories) this.data.trajectories = [];
     if (!this.data.stats) this.data.stats = { total_patterns: 0, total_memories: 0, total_trajectories: 0, total_errors: 0, session_count: 0, last_session: 0 };
     this.data.trajectories.push({ id, state, action, outcome, reward, timestamp: this.now() });
-    if (this.data.trajectories.length > 1000) this.data.trajectories.splice(0, 200);
+    if (this.data.trajectories.length > RV_MAX_TRAJECTORIES) this.data.trajectories.splice(0, this.data.trajectories.length - RV_MAX_TRAJECTORIES); // [neon-direct]
     this.data.stats.total_trajectories = this.data.trajectories.length;
 
     // End trajectory in engine if already initialized (don't trigger lazy load)
@@ -6856,7 +6875,7 @@ hooksCmd.command('pretrain')
           .sort((a, b) => b[1] - a[1]);
 
         // Store as sequence patterns
-        strongPatterns.slice(0, 100).forEach(([key, count]) => {
+        strongPatterns.slice(0, (Number(process.env.RUVECTOR_PRETRAIN_MAX_PAIRS) || Infinity)).forEach(/* [uncap] */ ([key, count]) => {
           const [file1, file2] = key.split('|');
           if (!intel.data.sequences) intel.data.sequences = {};
           if (!intel.data.sequences[file1]) intel.data.sequences[file1] = [];
@@ -6899,10 +6918,10 @@ hooksCmd.command('pretrain')
         const filePath = path.join(process.cwd(), filename);
         if (fs.existsSync(filePath)) {
           try {
-            const content = fs.readFileSync(filePath, 'utf-8').slice(0, 2000); // First 2KB
+            const content = fs.readFileSync(filePath, 'utf-8').slice(0, (Number(process.env.RUVECTOR_PRETRAIN_MAX_CHARS) || Infinity)); /* [uncap] */
             intel.data.memories = intel.data.memories || [];
             intel.data.memories.push({
-              content: `[${filename}] ${content.replace(/\n/g, ' ').slice(0, 500)}`,
+              content: `[${filename}] ${content.replace(/\n/g, ' ').slice(0, (Number(process.env.RUVECTOR_PRETRAIN_MAX_CHARS) || Infinity))}`, /* [uncap] */
               type: 'project',
               created: new Date().toISOString(),
               embedding: intel.simpleEmbed ? intel.simpleEmbed(content) : null
@@ -6956,7 +6975,7 @@ hooksCmd.command('pretrain')
         const parser = new ASTParser();
         const codeFiles = (intel.data.fileList || []).filter(f =>
           ['.ts', '.js', '.tsx', '.jsx', '.py', '.rs', '.go'].includes(path.extname(f))
-        ).slice(0, 50); // Analyze up to 50 files
+        ).slice(0, (Number(process.env.RUVECTOR_PRETRAIN_MAX_FILES) || Infinity)); /* [uncap] */
 
         let complexityStats = { high: 0, medium: 0, low: 0, total: 0 };
 
@@ -7083,11 +7102,11 @@ hooksCmd.command('pretrain')
       const graphMod = require('../dist/core/graph-algorithms.js');
       const codeFiles = execSync('git ls-files "*.ts" "*.js" 2>/dev/null || echo ""', { encoding: 'utf-8' }).trim().split('\n').filter(f => f);
 
-      if (codeFiles.length > 5 && codeFiles.length < 200) {
+      if (codeFiles.length > 5 && codeFiles.length < (Number(process.env.RUVECTOR_PRETRAIN_MAX_FILES) || Infinity)) { /* [uncap] */
         const nodes = codeFiles.map(f => path.basename(f, path.extname(f)));
         const edges = [];
 
-        for (const file of codeFiles.slice(0, 100)) {
+        for (const file of codeFiles.slice(0, (Number(process.env.RUVECTOR_PRETRAIN_MAX_FILES) || Infinity))) { /* [uncap] */
           try {
             if (!fs.existsSync(file)) continue;
             const content = fs.readFileSync(file, 'utf-8');
