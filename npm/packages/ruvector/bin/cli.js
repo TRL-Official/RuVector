@@ -4386,6 +4386,8 @@ class Intelligence {
       baseStats.total_memories = (this.data.memories || []).length;
       baseStats.total_trajectories = (this.data.trajectories || []).length;
     }
+    // [neon-direct] memories and trajectories are lazy (never loaded whole): their counters come from Neon
+    if (RVN_ON && baseStats) { try { baseStats.total_memories = rvn().rows.count('memories'); baseStats.total_trajectories = rvn().rows.count('trajectories'); } catch { /* keep the stored counters */ } }
 
     // Only use engine if already initialized (don't trigger lazy load for optional stats)
     const eng = this.getEngineIfReady();
