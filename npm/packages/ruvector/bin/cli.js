@@ -11,8 +11,10 @@ const path = require('path');
 // [neon-direct] state goes to Neon when RUVECTOR_STORE=neon; caps are opt-in (env), not built in.
 const RVN_ON = process.env.RUVECTOR_STORE === 'neon';
 let _rvn = null;
-const rvn = () => (_rvn ??= require("./neon-doc-store.cjs").openDocStore({
-  store: process.env.RVN_STORE_NAME || 'ruvector-intel', keyed: ["patterns","errors","agents","coEditPatterns","sequences","activeTrajectories","compressedPatterns","dirPatterns","changePatterns"], lazy: ['memories'] }));
+// RVN_STORE_MODULE: the Neon store module to use instead of the bundled ./neon-doc-store.cjs (digital-twin's
+// install.sh points it at its live copy, which talks to the connection holder — one source of truth)
+const rvn = () => (_rvn ??= require(process.env.RVN_STORE_MODULE || "./neon-doc-store.cjs").openDocStore({
+  store: process.env.RVN_STORE_NAME || 'ruvector-intel', keyed: ["patterns","errors","agents","coEditPatterns","sequences","activeTrajectories","compressedPatterns","dirPatterns","changePatterns"], lazy: ['memories', 'trajectories'] }));
 const rvnIsIntel = (p) => RVN_ON && path.basename(p) === 'intelligence.json';
 const RV_MAX_MEMORIES = Number(process.env.RUVECTOR_MAX_MEMORIES) || Infinity;
 const RV_MAX_TRAJECTORIES = Number(process.env.RUVECTOR_MAX_TRAJECTORIES) || Infinity;

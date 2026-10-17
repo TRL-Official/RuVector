@@ -36,12 +36,22 @@ function makeCaller() {
   const timeout = Number(process.env.RVN_TIMEOUT_MS) || 20000;
   // The worker inherits the host's execArgv; --input-type (node -e hosts) is refused for a file worker.
   const execArgv = process.execArgv.filter((a) => !a.startsWith('--input-type'));
-  const worker = new Worker(path.join(__dirname, 'neon-doc-worker.mjs'), { workerData: { url, driver }, execArgv });
+  // the connection holder (neon-holder.mjs), when its socket exists; otherwise Neon directly
+  const holder = process.env.NEON_HOLDER_SOCK;
+  const sock = holder && require('node:fs').existsSync(holder) ? holder : null;
+  const worker = new Worker(path.join(__dirname, 'neon-doc-worker.mjs'), { workerData: { url, driver, sock }, execArgv });
   worker.unref(); // never keep a CLI process alive
-  return function call(stmts) {
+  // NEON_TRACE=1: round trips and their time, per process, to stderr at exit (diagnostics only)
+  const tr = process.env.NEON_TRACE === '1' ? { n: 0, ms: 0, slow: [] } : null;
+  if (tr) process.on('exit', () => process.stderr.write(`[neon-trace doc kinds] ${JSON.stringify((tr.all || []).reduce((m, k) => (m[k] = (m[k] || 0) + 1, m), {}))}\n[neon-trace doc] ${tr.n} round trips, ${tr.ms} ms; slowest: ${tr.slow.sort((a, b) => b[0] - a[0]).slice(0, 5).map((x) => x.join(' ')).join(' | ')}\n`));
+  return function call(stmts, cache) {
+    const t0 = tr && Date.now();
+    try { return call0(stmts, cache); } finally { if (tr) { const d = Date.now() - t0; tr.n++; tr.ms += d; tr.all = tr.all || []; tr.all.push(stmts[0].text.trim().split(/\s+/).slice(0, 3).join(' ') + (cache ? ':load' : '')); tr.slow.push([d, stmts[0].text.replace(/\s+/g, ' ').slice(0, 28) + ' [' + String((stmts[0].params || [])[0]).slice(0, 50) + ']' + (cache ? ' (cacheable)' : '')]); } }
+  };
+  function call0(stmts, cache) {
     const sab = new SharedArrayBuffer(4);
     const { port1, port2 } = new MessageChannel();
-    worker.postMessage({ stmts, sab, port: port2 }, [port2]);
+    worker.postMessage({ stmts, cache, sab, port: port2 }, [port2]);
     const r = Atomics.wait(new Int32Array(sab), 0, 0, timeout);
     const msg = receiveMessageOnPort(port1);
     port1.close();
@@ -73,6 +83,11 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
   const WINDOW = Number(process.env.RVN_WINDOW ?? window) || 0;
   const call = (sharedCall ??= makeCaller());
   let snapshot = new Map(); // `${coll}\u0000${rid}` → JSON of body as loaded/saved
+  // Row ids of lazy-collection elements, by object identity: an element this process loaded or saved
+  // keeps its row; a NEW element always gets a row of its own. Ids alone cannot decide it — ruvector's
+  // learn() names trajectories traj_<seconds>, so two hooks in one second (any session) share an id,
+  // and with the collection not loaded the second would have overwritten the first row.
+  const lazyRid = new WeakMap();
   const stats = { loads: 0, saves: 0, upserts: 0, deletes: 0, ms: 0 };
 
   let uidN = 0;
@@ -82,7 +97,22 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
     const rows = [];
     for (const [key, val] of Object.entries(doc)) {
       if (val === undefined) continue;
-      if (Array.isArray(val)) {
+      if (Array.isArray(val) && LAZY.includes(key)) {
+        const used = new Set();
+        for (const el of val) {
+          const obj = el && typeof el === 'object';
+          let rid = obj ? lazyRid.get(el) : undefined;
+          if (!rid || used.has(rid)) {
+            const base = obj && (typeof el.id === 'string' || typeof el.id === 'number') ? `id:${el.id}`
+              : `h:${createHash('sha1').update(JSON.stringify(el)).digest('hex').slice(0, 20)}`;
+            rid = `${base}~${uid()}`;
+            if (obj) lazyRid.set(el, rid);
+          }
+          used.add(rid);
+          rows.push({ coll: key, rid, body: el, kind: 'a' });
+        }
+        if (val.length === 0) rows.push({ coll: '_doc', rid: `[]${key}`, body: [], kind: 'e' });
+      } else if (Array.isArray(val)) {
         // Elements without an id are identified by content. An element this process LOADED keeps the
         // row id it came with (first unclaimed row with the same content hash); a NEW element gets a
         // fresh unique id — so two sessions appending identical-looking entries (a history of
@@ -125,6 +155,15 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
                seq bigserial, ver int NOT NULL DEFAULT 1, updated_at timestamptz NOT NULL DEFAULT now(),
                vec vector(${DIM}), PRIMARY KEY (store, coll, rid))` },
     { text: `CREATE INDEX IF NOT EXISTS rec_vec_hnsw ON ${T} USING hnsw (vec vector_cosine_ops)` },
+    // NOTHING IS EVER LOST: every deleted row — by any tool, any session (ruflo pruning its patterns,
+    // a JSON store rewritten without an entry, a file unlinked) — is copied here first, by Postgres.
+    { text: `CREATE TABLE IF NOT EXISTS ${schema}.rec_deleted (store text NOT NULL, coll text NOT NULL, rid text NOT NULL, body jsonb,
+               vec vector(${DIM}), seq bigint, ver int, deleted_at timestamptz NOT NULL DEFAULT now())` },
+    { text: `CREATE INDEX IF NOT EXISTS rec_deleted_store ON ${schema}.rec_deleted (store, coll)` },
+    { text: `CREATE OR REPLACE FUNCTION ${schema}.rec_keep_deleted() RETURNS trigger LANGUAGE plpgsql AS $f$
+               BEGIN INSERT INTO ${schema}.rec_deleted (store, coll, rid, body, vec, seq, ver) VALUES (OLD.store, OLD.coll, OLD.rid, OLD.body, OLD.vec, OLD.seq, OLD.ver);
+               RETURN OLD; END $f$` },
+    { text: `CREATE OR REPLACE TRIGGER rec_keep_deleted BEFORE DELETE ON ${T} FOR EACH ROW EXECUTE FUNCTION ${schema}.rec_keep_deleted()` },
   ];
   // DDL only when the table is missing: CREATE INDEX IF NOT EXISTS still locks the table, and
   // every hook process loads.
@@ -149,7 +188,10 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
                    WHERE store = $1 AND coll = ANY($2::text[]) ORDER BY seq DESC LIMIT $3) w
                ) d ORDER BY seq`, params: [store, LAZY, WINDOW] },
     ];
-    const [rows] = withTable(() => call(SELECT));
+    // the holder may answer from memory when the store's fingerprint is unchanged (no session wrote to
+    // it since); a window of lazy rows changes with every append, so only window-less loads are cached
+    const cache = WINDOW ? undefined : { key: `${schema}\u0000${store}\u0000${LAZY.join(',')}`, store, table: T, lazy: LAZY };
+    const [rows] = withTable(() => call(SELECT, cache));
     stats.loads++; stats.ms += Date.now() - t;
     const seen = new Map();
     if (!peek) snapshot = seen;
@@ -165,6 +207,7 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
         (doc[coll] ??= {})[rid.slice(2)] = body;
       } else {
         (doc[coll] ??= []).push(body);
+        if (LAZY.includes(coll) && body && typeof body === 'object') lazyRid.set(body, rid);
       }
     }
     return doc;
@@ -281,7 +324,9 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
   // Does the store hold anything? (one indexed lookup, cheaper than load)
   function exists() { return withTable(() => call([{ text: `SELECT 1 FROM ${T} WHERE store = $1 LIMIT 1`, params: [store] }]))[0].length > 0; }
 
-  return { load, save, search, rows, drop, exists, stats, query: (text, params) => withTable(() => call([{ text, params }])[0]) };
+  // ensure(): the full DDL, idempotent — for a store table created before the deleted-rows archive
+  function ensure() { call(DDL); }
+  return { load, save, search, rows, drop, exists, ensure, stats, query: (text, params) => withTable(() => call([{ text, params }])[0]) };
 }
 
 module.exports = { openDocStore };
