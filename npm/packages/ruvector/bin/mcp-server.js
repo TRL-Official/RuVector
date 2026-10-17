@@ -24,6 +24,13 @@ const {
 } = require('@modelcontextprotocol/sdk/types.js');
 const path = require('path');
 const fs = require('fs');
+// [neon-direct] the MCP server's intelligence store goes to Neon too when RUVECTOR_STORE=neon — the same store,
+// layout and module as bin/cli.js (RVN_STORE_MODULE overrides the bundled ./neon-doc-store.cjs). Memories and
+// trajectories are lazy collections: never loaded whole, counted and searched in Neon.
+const RVN_ON = process.env.RUVECTOR_STORE === 'neon';
+let _rvn = null;
+const rvn = () => (_rvn ??= require(process.env.RVN_STORE_MODULE || "./neon-doc-store.cjs").openDocStore({
+  store: process.env.RVN_STORE_NAME || 'ruvector-intel', keyed: ["patterns","errors","agents","coEditPatterns","sequences","activeTrajectories","compressedPatterns","dirPatterns","changePatterns"], lazy: ['memories', 'trajectories'] }));
 const { execFileSync } = require('child_process');
 
 // ADR-256: default-deny MCP tool-access policy (RUVECTOR_MCP_ALLOW/DENY/PROFILE)
@@ -277,6 +284,12 @@ class Intelligence {
 
   load() {
     const defaults = () => ({ patterns: {}, memories: [], trajectories: [], errors: {}, agents: {}, edges: [] });
+    if (RVN_ON) { // [neon-direct]
+      const d = rvn().load();
+      if (!d || typeof d !== 'object' || Array.isArray(d)) return defaults();
+      if (!Array.isArray(d.memories)) d.memories = [];
+      return d;
+    }
     // A missing store is a legitimate fresh start.
     if (!fs.existsSync(this.intelPath)) return defaults();
     let data;
@@ -417,7 +430,7 @@ class Intelligence {
 
   save() {
     const dir = path.dirname(this.intelPath);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (!RVN_ON && !fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true }); // [neon-direct] no local dir
 
     // Export engine data if available
     if (this.engine) {
@@ -427,14 +440,16 @@ class Intelligence {
       } catch {}
     }
 
+    if (RVN_ON) { rvn().save(this.data); return; } // [neon-direct]
     atomicWriteFileSync(this.intelPath, JSON.stringify(this.data, null, 2));
   }
 
   stats() {
     const baseStats = {
       total_patterns: Object.keys(this.data.patterns || {}).length,
-      total_memories: (this.data.memories || []).length,
-      total_trajectories: (this.data.trajectories || []).length,
+      // [neon-direct] lazy collections are counted in Neon (the loaded copy holds none of them)
+      total_memories: RVN_ON ? rvn().rows.count('memories') : (this.data.memories || []).length,
+      total_trajectories: RVN_ON ? rvn().rows.count('trajectories') : (this.data.trajectories || []).length,
       total_errors: Object.keys(this.data.errors || {}).length
     };
 
@@ -520,6 +535,11 @@ class Intelligence {
   }
 
   async recall(query, topK = 5) {
+    if (RVN_ON && this.engine) { // [neon-direct] the search runs in Neon, over every memory (as bin/cli.js)
+      const qe = await this.engine.embedAsync(query);
+      return rvn().search('memories', Array.from(qe), topK).map(r => ({
+        content: r.content || '', type: r.memory_type || r.type || 'general', score: r.score || 0, created: r.timestamp, engineResult: false }));
+    }
     // Use engine if available (HNSW search - 150x faster)
     if (this.engine) {
       try {
