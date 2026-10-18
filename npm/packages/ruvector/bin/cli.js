@@ -5055,6 +5055,7 @@ hooksCmd.command('trajectory-begin')
   .requiredOption('-c, --context <context>', 'Task or operation context')
   .option('-a, --agent <agent>', 'Agent performing the task', 'unknown')
   .option('-f, --file <file>', 'Primary file being worked on')
+  .option('--session <id>', 'Session that owns the trajectory (neon-direct: one shared store, several sessions)')
   .action((opts) => {
     const intel = new Intelligence({ skipEngine: true });  // Fast mode - no engine needed
     const trajId = `traj_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
@@ -5064,6 +5065,7 @@ hooksCmd.command('trajectory-begin')
       context: opts.context,
       agent: opts.agent,
       file: opts.file || null,
+      ...(opts.session ? { session: String(opts.session) } : {}),
       steps: [],
       startTime: Date.now()
     };
@@ -5071,20 +5073,30 @@ hooksCmd.command('trajectory-begin')
     console.log(JSON.stringify({ success: true, trajectory_id: trajId, context: opts.context, agent: opts.agent }));
   });
 
+// [neon-direct] With --session, step/end touch only that session's newest open trajectory. In neon-direct mode
+// every session shares one store, and "the newest open trajectory" was often another session's: steps landed
+// in it and one session's Stop closed another's turn. Without --session: the upstream behaviour.
+function pickTrajectory(trajectories, session) {
+  const ids = Object.keys(trajectories);
+  if (!session) return ids[ids.length - 1];
+  for (let i = ids.length - 1; i >= 0; i--) if (trajectories[ids[i]] && trajectories[ids[i]].session === String(session)) return ids[i];
+  return undefined;
+}
+
 hooksCmd.command('trajectory-step')
   .description('Add a step to the current trajectory')
   .requiredOption('-a, --action <action>', 'Action taken')
   .option('-r, --result <result>', 'Result of action')
   .option('--reward <reward>', 'Reward signal (0-1)', '0.5')
+  .option('--session <id>', 'Only this session\'s trajectory')
   .action((opts) => {
     const intel = new Intelligence({ skipEngine: true });  // Fast mode
     const trajectories = intel.data.activeTrajectories || {};
-    const trajIds = Object.keys(trajectories);
-    if (trajIds.length === 0) {
+    const latestTrajId = pickTrajectory(trajectories, opts.session);
+    if (!latestTrajId) {
       console.log(JSON.stringify({ success: false, error: 'No active trajectory' }));
       return;
     }
-    const latestTrajId = trajIds[trajIds.length - 1];
     trajectories[latestTrajId].steps.push({
       action: opts.action,
       result: opts.result || '',
@@ -5099,15 +5111,15 @@ hooksCmd.command('trajectory-end')
   .description('End the current trajectory with a quality score')
   .option('--success', 'Task succeeded')
   .option('--quality <quality>', 'Quality score (0-1)', '0.5')
+  .option('--session <id>', 'Only this session\'s trajectory')
   .action((opts) => {
     const intel = new Intelligence({ skipEngine: true });  // Fast mode
     const trajectories = intel.data.activeTrajectories || {};
-    const trajIds = Object.keys(trajectories);
-    if (trajIds.length === 0) {
+    const latestTrajId = pickTrajectory(trajectories, opts.session);
+    if (!latestTrajId) {
       console.log(JSON.stringify({ success: false, error: 'No active trajectory' }));
       return;
     }
-    const latestTrajId = trajIds[trajIds.length - 1];
     const traj = trajectories[latestTrajId];
     const quality = opts.success ? 0.8 : parseFloat(opts.quality);
     traj.endTime = Date.now();
