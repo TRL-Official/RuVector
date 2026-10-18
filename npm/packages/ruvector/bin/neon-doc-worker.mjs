@@ -33,7 +33,10 @@ const viaHolder = (stmts, cache) => new Promise((resolve, reject) => {
   if (!sock) {
     sock = net.connect(workerData.sock); sock.unref();
     sock.setEncoding('utf8');
-    sock.on('data', lineReader((line) => { const w = waiting.shift(); if (w) w(JSON.parse(line)); }));
+    // a rows reply ({"id":N,"rows":…}, the holder's key order) goes to the main thread as the raw text: a string
+    // crosses threads as one copy, while parsing here AND structured-cloning the object graph cost ~1.8 s for
+    // the 14 MB policy chain (2026-10-18). Errors and transport failures are parsed here as before.
+    sock.on('data', lineReader((line) => { const w = waiting.shift(); if (w) w(/^\{"id":\d+,"rows":/.test(line.slice(0, 40)) ? { raw: line } : JSON.parse(line)); }));
     const fail = (e) => {
       // a socket file without a holder behind it: remove it, so the next wrapper call starts one
       if (e && e.code === 'ECONNREFUSED') { try { fs.unlinkSync(workerData.sock); } catch { /* gone */ } }
@@ -51,12 +54,12 @@ parentPort.on('message', async ({ stmts, cache, sab, port }) => {
   try {
     let rows;
     if (workerData.sock) {
-      try { const m = await viaHolder(stmts, cache); if (m.error) throw new Error(m.error); rows = m.rows; }
+      try { const m = await viaHolder(stmts, cache); if (m.error) throw new Error(m.error); if (m.raw !== undefined) reply = { raw: m.raw }; else rows = m.rows; }
       catch (e) { if (!e.transport) throw e; rows = await viaDriver(stmts); }
     } else rows = await viaDriver(stmts);
-    reply = { rows };
+    reply ??= { rows };
   } catch (e) {
-    reply = { error: String(e && e.message || e) };
+    reply = { error: String(e && e.message || e), code: e && e.code };
   }
   port.postMessage(reply);
   port.close();
