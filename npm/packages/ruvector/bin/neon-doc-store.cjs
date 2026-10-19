@@ -118,6 +118,37 @@ function merge3(base, ours, theirs) {
 // One worker per process, shared by every store opened in it (neon-fs.mjs opens one per file).
 let sharedCall = null;
 
+// Batched writes (2026-10-19, RUFLO-ROUND-TRIPS-2026-10-19.md § 6). Between beginBatch() and commitBatch(), a save()
+// that fits in one chunk queues its statements instead of sending them, and commitBatch() sends every queued
+// statement in ONE call — one transaction, all or nothing — then settles each store's conflicts exactly as an
+// immediate save would. ruflo's policy transaction writes four files one after another under its lock (the receipt
+// archive, state.json, the anchor log, the anchor head): four round trips became one.
+// Read-your-writes is kept: a read through a store with queued writes, and ANY call that is not a plain read
+// (a delete, a query, an immediate write), sends the queue first, so the order of writes never changes.
+// abortBatch() drops the queue and puts each store's snapshot back as it was before its queued saves; a failed
+// commit does the same and throws, so the caller's transaction fails as a failed write would.
+let batch = null;   // { items: [{ owner, stmts, done(results), undo() }] }
+function flushBatch() {
+  if (!batch || !batch.items.length) return;
+  const items = batch.items; batch.items = [];
+  for (const it of items) it.owner.queued = 0;
+  const stmts = [PIN]; for (const it of items) stmts.push(...it.stmts);
+  let res;
+  try { res = items[0].owner.withTable(() => items[0].owner.raw(stmts)); }
+  catch (e) { for (const it of items.slice().reverse()) it.undo(); throw e; }
+  let i = 1;
+  for (const it of items) { it.done(res.slice(i, i + it.stmts.length)); i += it.stmts.length; }
+}
+function beginBatch() { if (batch) throw new Error('neon-doc-store: a write batch is already open'); batch = { items: [] }; }
+function commitBatch() { try { flushBatch(); } finally { batch = null; } }
+function abortBatch() {
+  if (!batch) return 0;
+  const items = batch.items; batch = null;
+  for (const it of items.slice().reverse()) { it.owner.queued = 0; it.undo(); }
+  return items.length;
+}
+const batchOpen = () => !!batch;
+
 // --- embeddings kept once (see the header) ---
 const MARK = 'rvdirect:vec';
 // the body as written, with the embedding rebuilt from vec when it was stripped. `a` = the table alias.
@@ -151,9 +182,12 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
   const LAZY = [...lazy];
   const DIM = Number(process.env.RVN_DIM) || 384;
   const WINDOW = Number(process.env.RVN_WINDOW ?? window) || 0;
-  const call = (sharedCall ??= makeCaller());
+  const raw = (sharedCall ??= makeCaller());
+  // inside a write batch: send the queue first unless this is a plain read of a store with nothing queued
+  const owner = { queued: 0, raw, withTable: (fn) => withTable(fn) };
+  const call = (stmts, cache, read = false) => { if (batch && batch.items.length && (owner.queued || !read)) flushBatch(); return raw(stmts, cache); };
   // statements whose SQL uses REB: run after PIN, in one transaction; the PIN's own result is dropped
-  const callPinned = (stmts) => call([PIN, ...stmts]).slice(1);
+  const callPinned = (stmts, read = false) => call([PIN, ...stmts], undefined, read).slice(1);
   const STRIP = process.env.RVN_EMBED_IN_VEC === '1';
   let snapshot = new Map(); // `${coll}\u0000${rid}` → JSON of body as loaded/saved
   // Row ids of lazy-collection elements, by object identity: an element this process loaded or saved
@@ -273,7 +307,13 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
   const PRIME_MS = Number(process.env.RVN_PRIME_MS ?? 3000);
   const MEMO = !WINDOW && process.env.RVN_NO_MEMO !== '1';
   const fpOf = (rows) => { let n = 0, s = 0n, v = 0n; for (const r of rows) { if (LAZY.includes(r.coll)) continue; if (r.seq == null || r.ver == null) return null; n++; const q = BigInt(Math.round(Number(r.seq))); if (q > s) s = q; v += BigInt(r.ver); } return `${n}:${s}:${v}`; };
-  stats.memoHits = 0; stats.trustHits = 0;
+  stats.memoHits = 0; stats.trustHits = 0; stats.vouched = 0;
+  // the fingerprint query — also run by others in a round trip of their own (neon-fs: with taking ruflo's policy lock)
+  const FP = () => ({ text: `SELECT count(*)::int AS n, coalesce(max(seq), 0)::text AS s, coalesce(sum(ver), 0)::text AS v
+                   FROM ${T} WHERE store = $1 AND NOT (coll = ANY($2::text[]))`, params: [store, LAZY] });
+  // vouch(row): does a fingerprint row (FP() run elsewhere) still describe this process's memo? The caller decides
+  // what that proves (neon-fs: nobody else may write the store while it holds the lock it took in that round trip)
+  const vouch = (f) => { const ok = !!(MEMO && memo && !memo.primedAt && f && `${f.n}:${f.s}:${f.v}` === memo.fp); if (ok) stats.vouched++; return ok; };
   // load() also records what this process has SEEN (the snapshot save() diffs against). peek=true reads
   // without that — for a stat or an existence check, which must not widen what a later save may delete.
   // trust=true (2026-10-19): answer a repeat load from the memo WITHOUT the fingerprint query. Only for a caller that
@@ -288,8 +328,7 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
     } else if (MEMO && memo && trust) {
       rows = memo.rows.map((r) => ({ coll: r.coll, rid: r.rid, body: JSON.parse(r.j), j: r.j })); stats.trustHits++;
     } else if (MEMO && memo) {
-      const [[f]] = withTable(() => call([{ text: `SELECT count(*)::int AS n, coalesce(max(seq), 0)::text AS s, coalesce(sum(ver), 0)::text AS v
-                   FROM ${T} WHERE store = $1 AND NOT (coll = ANY($2::text[]))`, params: [store, LAZY] }]));
+      const [[f]] = withTable(() => call([FP()], undefined, true));
       if (`${f.n}:${f.s}:${f.v}` === memo.fp) { rows = memo.rows.map((r) => ({ coll: r.coll, rid: r.rid, body: JSON.parse(r.j), j: r.j })); stats.memoHits++; }
     }
     if (!rows) {
@@ -307,7 +346,7 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
       // A window-less load holds no lazy rows (LIMIT 0), so it needs no PIN, and the holder's cached answer
       // (non-lazy rows only, neon-holder.mjs) is the same document.
       const cache = WINDOW ? undefined : { key: `${schema}\u0000${store}\u0000${LAZY.join(',')}`, store, table: T, lazy: LAZY };
-      [rows] = withTable(() => (cache ? call(SELECT, cache) : callPinned(SELECT)));
+      [rows] = withTable(() => (cache ? call(SELECT, cache, true) : callPinned(SELECT, true)));
       fresh = true;
     }
     stats.loads++; stats.ms += Date.now() - t;
@@ -378,7 +417,7 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
            SELECT coll, rid FROM upd UNION ALL SELECT coll, rid FROM ins`,
     params: [store, JSON.stringify(rows), LAZY],
   });
-  function writeRows(up, del = []) {
+  function writeRows(up, del = [], undo = () => {}) {
     if (!up.length && !del.length) return;
     memo = null;   // any write: the next load reads Neon again
     up = up.map((u, i) => ({ ord: i, coll: u.coll, rid: u.rid, body: u.body, ...('base' in u ? { base: u.base } : {}) }));
@@ -402,6 +441,12 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
              WHERE t.store = $1 AND t.coll = x.coll AND t.rid = x.rid AND (NOT x.checked OR x.base IS NULL OR ${SAME('t')})`,
       params: [store, JSON.stringify(del)],
     };
+    if (batch && chunks.length <= 1) {   // a write batch is open: queue it (one chunk only; a bigger save goes now, in order)
+      const stmts = chunks.length ? (delStmt ? [write(chunks[0]), delStmt] : [write(chunks[0])]) : [delStmt];
+      batch.items.push({ owner, stmts, undo, done: (res) => { if (chunks.length) resolveConflicts(chunks[0], res[0]); } });
+      owner.queued++; stats.batched = (stats.batched || 0) + 1;
+      return;
+    }
     if (!chunks.length) withTable(() => callPinned([delStmt]));
     chunks.forEach((c, i) => {
       const res = withTable(() => callPinned(i === chunks.length - 1 && delStmt ? [write(c), delStmt] : [write(c)]));
@@ -454,7 +499,8 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
     const del = [];
     for (const k of snapshot.keys()) if (!now.has(k)) { const [coll, rid] = k.split('\u0000'); del.push({ coll, rid, base: snapshot.get(k) }); }
     if (!up.length && !del.length) return { upserts: 0, deletes: 0 };
-    writeRows(up, del);
+    const before = snapshot;
+    writeRows(up, del, () => { snapshot = before; memo = null; });   // undo: only if a write batch is dropped
     memo = null;   // what Neon holds now is not what was loaded
     snapshot = now;
     stats.saves++; stats.upserts += up.length; stats.deletes += del.length; stats.ms += Date.now() - t;
@@ -532,11 +578,13 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
   // Remove the whole store (a deleted file).
   function drop() { withTable(() => call([{ text: `DELETE FROM ${T} WHERE store = $1`, params: [store] }])); snapshot = new Map(); memo = null; }
   // Does the store hold anything? (one indexed lookup, cheaper than load)
-  function exists() { return withTable(() => call([{ text: `SELECT 1 FROM ${T} WHERE store = $1 LIMIT 1`, params: [store] }]))[0].length > 0; }
+  function exists() { return withTable(() => call([{ text: `SELECT 1 FROM ${T} WHERE store = $1 LIMIT 1`, params: [store] }], undefined, true))[0].length > 0; }
 
   // ensure(): the full DDL, idempotent — for a store table created before the deleted-rows archive
   function ensure() { call(DDL); }
-  return { load, save, prime, search, rows, drop, exists, ensure, stats, conflicts, query: (text, params) => withTable(() => call([{ text, params }])[0]) };
+  return { load, save, prime, search, rows, drop, exists, ensure, stats, conflicts, query: (text, params) => withTable(() => call([{ text, params }])[0]),
+    // several statements in one round trip (one transaction): the results, one per statement
+    queryMany: (stmts) => withTable(() => call(stmts)), fpStmt: FP, vouch, hasMemo: () => !!(MEMO && memo && !memo.primedAt) };
 }
 
-module.exports = { openDocStore, merge3 };
+module.exports = { openDocStore, merge3, beginBatch, commitBatch, abortBatch, batchOpen };
