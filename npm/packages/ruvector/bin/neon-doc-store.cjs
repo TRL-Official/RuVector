@@ -60,7 +60,8 @@ function makeCaller() {
   if (tr) process.on('exit', () => process.stderr.write(`[neon-trace doc kinds] ${JSON.stringify((tr.all || []).reduce((m, k) => (m[k] = (m[k] || 0) + 1, m), {}))}\n[neon-trace doc] ${tr.n} round trips, ${tr.ms} ms; slowest: ${tr.slow.sort((a, b) => b[0] - a[0]).slice(0, 5).map((x) => x.join(' ')).join(' | ')}\n`));
   return function call(stmts, cache) {
     const t0 = tr && Date.now();
-    try { return call0(stmts, cache); } finally { if (tr) { const d = Date.now() - t0; tr.n++; tr.ms += d; tr.all = tr.all || []; tr.all.push(stmts[0].text.trim().split(/\s+/).slice(0, 3).join(' ') + (cache ? ':load' : '')); tr.slow.push([d, stmts[0].text.replace(/\s+/g, ' ').slice(0, 28) + ' [' + String((stmts[0].params || [])[0]).slice(0, 50) + ']' + (cache ? ' (cacheable)' : '')]); } }
+    // the trace names a round trip by its first statement that is not the extra_float_digits pin (2026-10-19)
+    try { return call0(stmts, cache); } finally { if (tr) { const d = Date.now() - t0; const s0 = stmts.find((x) => !/^SET LOCAL extra_float_digits/.test(x.text)) || stmts[0]; tr.n++; tr.ms += d; tr.all = tr.all || []; tr.all.push(s0.text.trim().split(/\s+/).slice(0, 3).join(' ') + (cache ? ':load' : '')); tr.slow.push([d, s0.text.replace(/\s+/g, ' ').slice(0, 28) + ' [' + String((s0.params || [])[0]).slice(0, 50) + ']' + (cache ? ' (cacheable)' : '')]); } }
   };
   function call0(stmts, cache) {
     const sab = new SharedArrayBuffer(4);
@@ -272,15 +273,20 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
   const PRIME_MS = Number(process.env.RVN_PRIME_MS ?? 3000);
   const MEMO = !WINDOW && process.env.RVN_NO_MEMO !== '1';
   const fpOf = (rows) => { let n = 0, s = 0n, v = 0n; for (const r of rows) { if (LAZY.includes(r.coll)) continue; if (r.seq == null || r.ver == null) return null; n++; const q = BigInt(Math.round(Number(r.seq))); if (q > s) s = q; v += BigInt(r.ver); } return `${n}:${s}:${v}`; };
-  stats.memoHits = 0;
+  stats.memoHits = 0; stats.trustHits = 0;
   // load() also records what this process has SEEN (the snapshot save() diffs against). peek=true reads
   // without that — for a stat or an existence check, which must not widen what a later save may delete.
-  function load({ peek = false } = {}) {
+  // trust=true (2026-10-19): answer a repeat load from the memo WITHOUT the fingerprint query. Only for a caller that
+  // can prove nobody else may have written the store since its last load (neon-fs: the receipt archive while this
+  // process holds ruflo's policy lock, its only writer's lock). Any write here drops the memo, so it reloads.
+  function load({ peek = false, trust = false } = {}) {
     const t = Date.now();
     let rows = null, fresh = false;
     if (MEMO && memo && memo.primedAt && Date.now() - memo.primedAt < PRIME_MS) {
       rows = memo.rows.map((r) => ({ coll: r.coll, rid: r.rid, body: JSON.parse(r.j), j: r.j })); stats.primeHits = (stats.primeHits || 0) + 1;
       memo = { fp: memo.fp, rows: memo.rows };   // used once: the next load checks the fingerprint
+    } else if (MEMO && memo && trust) {
+      rows = memo.rows.map((r) => ({ coll: r.coll, rid: r.rid, body: JSON.parse(r.j), j: r.j })); stats.trustHits++;
     } else if (MEMO && memo) {
       const [[f]] = withTable(() => call([{ text: `SELECT count(*)::int AS n, coalesce(max(seq), 0)::text AS s, coalesce(sum(ver), 0)::text AS v
                    FROM ${T} WHERE store = $1 AND NOT (coll = ANY($2::text[]))`, params: [store, LAZY] }]));
