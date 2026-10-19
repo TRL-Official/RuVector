@@ -160,7 +160,7 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
   // learn() names trajectories traj_<seconds>, so two hooks in one second (any session) share an id,
   // and with the collection not loaded the second would have overwritten the first row.
   const lazyRid = new WeakMap();
-  const stats = { loads: 0, saves: 0, upserts: 0, deletes: 0, ms: 0 };
+  const stats = { loads: 0, saves: 0, upserts: 0, deletes: 0, ms: 0, searchExact: 0, searchIndex: 0 };
 
   let uidN = 0;
   const uid = () => `${process.pid.toString(36)}${Date.now().toString(36)}${(uidN++).toString(36)}${Math.random().toString(36).slice(2, 6)}`;
@@ -472,11 +472,26 @@ function openDocStore({ store, keyed = [], lazy = [], window = 0 }) {
     let where = '';
     for (const [f, v] of Object.entries(opts.eq || {})) { params.push(f, String(v)); where += ` AND body->>$${params.length - 1} = $${params.length}`; }
     if (opts.threshold != null) { params.push(opts.threshold); where += ` AND 1 - (vec <=> $2::vector) >= $${params.length}`; }
-    const [, rows] = withTable(() => callPinned([
-      { text: `SET LOCAL hnsw.ef_search = ${Math.max(40, k * 4)}` },
-      { text: `SELECT ${REB('s')} AS body, 1 - (vec <=> $2::vector) AS score FROM ${T} s
-               WHERE store = $1 AND coll = $3 AND vec IS NOT NULL${where} ORDER BY vec <=> $2::vector LIMIT $4`, params },
-    ]));
+    // Complete recall (2026-10-19). Every store shares ONE HNSW index, and the store filter was applied to its
+    // candidates afterwards: when the nearest candidates belonged to other stores, a search came back short or
+    // empty (2 of 50 memory searches in a rehearsal). Default now: an EXACT scan of the store's rows (ties by row id)
+    // — complete and truly nearest; ~20-25 ms on the server for 7,000 memories (the HNSW scan: <1 ms; the round
+    // trip ~105 ms either way). RVN_SEARCH=index keeps the index for large stores: pgvector >= 0.8's iterative scan
+    // (strict order; a guarded block, so an older pgvector skips it) keeps scanning until enough rows pass the
+    // filter, and a result still short of k is redone exactly. Counts in stats: searchIndex, searchExact.
+    const SELECT = { text: `SELECT ${REB('s')} AS body, 1 - (vec <=> $2::vector) AS score FROM ${T} s
+               WHERE store = $1 AND coll = $3 AND vec IS NOT NULL${where} ORDER BY vec <=> $2::vector, rid LIMIT $4`, params };
+    const exact = () => { stats.searchExact = (stats.searchExact || 0) + 1; return withTable(() => callPinned([{ text: 'SET LOCAL enable_indexscan = off' }, SELECT]))[1]; };
+    let rows;
+    if (process.env.RVN_SEARCH === 'index') {
+      stats.searchIndex = (stats.searchIndex || 0) + 1;
+      [, , rows] = withTable(() => callPinned([
+        { text: `SET LOCAL hnsw.ef_search = ${Math.max(40, k * 4)}` },
+        { text: `DO $i$ BEGIN PERFORM set_config('hnsw.iterative_scan', 'strict_order', true); EXCEPTION WHEN OTHERS THEN NULL; END $i$` },
+        SELECT,
+      ]));
+      if (rows.length < k) rows = exact();
+    } else rows = exact();
     stats.ms += Date.now() - t;
     return rows.map((r) => ({ ...EMB_OK(r.body, `${store} ${coll} (search)`), score: Number(r.score) }));
   }
