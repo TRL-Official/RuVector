@@ -101,6 +101,16 @@ const TASK_ALGORITHM_MAP: Record<TaskType, LearningConfig> = {
   },
 };
 
+// [neon-direct-uncap] A task that is not one of the six above (a caller's own task name) gets these settings.
+// Upstream returned undefined for it: `update` crashed, and `configure` with a partial config stored no learning
+// rate, so every update recorded a null delta and learned nothing.
+const DEFAULT_TASK_CONFIG: LearningConfig = {
+  algorithm: 'q-learning',
+  learningRate: 0.1,
+  discountFactor: 0.95,
+  epsilon: 0.1,
+};
+
 export class LearningEngine {
   private configs: Map<TaskType, LearningConfig> = new Map();
   private qTables: Map<string, Map<string, number>> = new Map();
@@ -138,7 +148,7 @@ export class LearningEngine {
    * Configure algorithm for a specific task type
    */
   configure(task: TaskType, config: Partial<LearningConfig>): void {
-    const existing = this.configs.get(task) || TASK_ALGORITHM_MAP[task];
+    const existing = this.configs.get(task) || TASK_ALGORITHM_MAP[task] || DEFAULT_TASK_CONFIG;
     this.configs.set(task, { ...existing, ...config });
   }
 
@@ -146,7 +156,7 @@ export class LearningEngine {
    * Get current configuration for a task
    */
   getConfig(task: TaskType): LearningConfig {
-    return this.configs.get(task) || TASK_ALGORITHM_MAP[task];
+    return this.configs.get(task) || TASK_ALGORITHM_MAP[task] || { ...DEFAULT_TASK_CONFIG };
   }
 
   /**

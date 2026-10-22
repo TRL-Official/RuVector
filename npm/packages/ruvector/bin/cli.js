@@ -3893,6 +3893,9 @@ class Intelligence {
   // Enhanced stats with engine metrics
   stats() {
     const baseStats = this.data.stats;
+    // [neon-direct-uncap] the stored total_errors counter is only refreshed by recordErrorFix(), so a store whose
+    // errors came another way (an import, another process) reported "0 error patterns" beside stored fixes
+    if (baseStats && this.data.errors && typeof this.data.errors === 'object') baseStats.total_errors = Object.keys(this.data.errors).length;
     // [neon-direct] memories and trajectories are lazy (never loaded whole): their counters come from Neon
     if (RVN_ON && baseStats) { try { baseStats.total_memories = rvn().rows.count('memories'); baseStats.total_trajectories = rvn().rows.count('trajectories'); } catch { /* keep the stored counters */ } }
 
@@ -7175,20 +7178,30 @@ hooksCmd.command('pretrain')
         engine.configure('context-ranking', { algorithm: 'ppo', clipRange: 0.2 });
         engine.configure('memory-recall', { algorithm: 'td-lambda', lambda: 0.8 });
 
-        // Bootstrap with initial experiences from file patterns
+        // Bootstrap with initial experiences from file patterns.
+        // [neon-direct-uncap] Since updateQ() a pattern is `"state|action": {state, action, q_value, visits,
+        // last_update}`; upstream read it as `state: {action: value}`, so it learned the FIELD NAMES as actions and
+        // timestamps as rewards. Both shapes are read now, and a reward is used only when it is a finite number
+        // in (0.3, 1] (rewards lie in [-1, 1]).
         let bootstrapCount = 0;
-        for (const [state, actions] of Object.entries(intel.data.patterns || {})) {
-          for (const [action, value] of Object.entries(actions)) {
-            if (value > 0.3) { // Only strong patterns
-              engine.update('agent-routing', {
-                state,
-                action,
-                reward: value,
-                nextState: state,
-                done: true
-              });
-              bootstrapCount++;
-            }
+        const bootstrapPairs = [];
+        for (const [key, entry] of Object.entries(intel.data.patterns || {})) {
+          if (entry && typeof entry === 'object' && typeof entry.action === 'string' && 'q_value' in entry) {
+            bootstrapPairs.push([entry.state ?? key.split('|')[0], entry.action, entry.q_value]);
+          } else if (entry && typeof entry === 'object') {
+            for (const [action, value] of Object.entries(entry)) bootstrapPairs.push([key, action, value]);
+          }
+        }
+        for (const [state, action, value] of bootstrapPairs) {
+          if (typeof value === 'number' && Number.isFinite(value) && value > 0.3 && value <= 1) { // Only strong patterns
+            engine.update('agent-routing', {
+              state,
+              action,
+              reward: value,
+              nextState: state,
+              done: true
+            });
+            bootstrapCount++;
           }
         }
 
