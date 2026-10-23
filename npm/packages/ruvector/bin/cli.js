@@ -132,6 +132,19 @@ function loadAttention() {
 
 const program = new Command();
 
+// [neon-direct-uncap] `brain` (a public shared store, https://pi.ruv.io unless --url / BRAIN_URL say otherwise) and
+// `edge` (a third-party compute network, URL hard-coded) send this machine's data to outside servers. The operator
+// of this build does not share ruvector state, so both refuse here, whatever wrapper, path or shell ran this file
+// (TRL-Official/digital-twin guard audit 2026-10-23: a regex guard on the command line missed 16 of 20 forms).
+// RUVECTOR_ALLOW_SHARE=1 turns them back on.
+{
+  const firstCommand = process.argv.slice(2).find((a) => !a.startsWith('-'));
+  if ((firstCommand === 'brain' || firstCommand === 'edge') && process.env.RUVECTOR_ALLOW_SHARE !== '1') {
+    console.error(`ruvector: '${firstCommand}' is disabled in this build: it sends data to outside servers (set RUVECTOR_ALLOW_SHARE=1 to enable).`);
+    process.exit(2);
+  }
+}
+
 // Get package version from package.json
 const packageJson = require('../package.json');
 
