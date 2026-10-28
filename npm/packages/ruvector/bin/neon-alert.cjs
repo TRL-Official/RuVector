@@ -7,7 +7,8 @@
 // .claude/scripts/neon-sentinel.mjs reads it on the next prompt, re-probes Neon and reports either
 // "not responding" or "back again". Never throws: recording a failure must not cause another.
 //   record(source, err)  · isOutage(err)  · file()  · read()  · clear() → the cleared note or null
-// Env: NEON_ALERT_FILE (tests), REPO_ROOT / DIGITAL_TWIN_ROOT (else the checkout around the cwd).
+// Env: NEON_ALERT_FILE (tests), REPO_ROOT / DIGITAL_TWIN_ROOT (else the checkout around the cwd). Under a throwaway
+// RVN_SCHEMA / NEON_SQL_SCHEMA_PREFIX (a gate) the note goes to <tmp>/neon-alert-<schema>.json, never the live file.
 'use strict';
 const fs = require('node:fs');
 const path = require('node:path');
@@ -28,9 +29,20 @@ function gitDir(start) {
   }
   return null;
 }
+// A gate runs in a THROWAWAY schema (never rvdirect / sq_*, the folder CLAUDE.md rule), and some provoke store errors
+// on purpose (embed-vec-test: a row with the embedding marker and no vector). Their notes went to the LIVE checkout's
+// file and the next prompt reported a Neon failure that never happened (2026-10-22, during fork-verify). A failure
+// under a schema that is not the live one is therefore noted in a scratch file of its own, never the live one.
+function liveSchemas(g) {
+  let c = {}; try { c = JSON.parse(fs.readFileSync(path.join(path.dirname(g || '.'), '.claude', 'neon-direct.json'), 'utf8')); } catch { /* defaults */ }
+  return { rv: c.rvSchema || 'rvdirect', sq: c.sqlPrefix || 'sq_' };
+}
 function file() {
   if (process.env.NEON_ALERT_FILE) return process.env.NEON_ALERT_FILE;
   const g = gitDir(process.env.REPO_ROOT || process.env.DIGITAL_TWIN_ROOT || process.cwd());
+  const live = liveSchemas(g), rv = process.env.RVN_SCHEMA, sq = process.env.NEON_SQL_SCHEMA_PREFIX;
+  const test = (rv && rv !== live.rv) ? rv : (sq && sq !== live.sq) ? sq : null;
+  if (test) return path.join(require('node:os').tmpdir(), `neon-alert-${test.replace(/[^A-Za-z0-9_]/g, '')}.json`);
   return g ? path.join(g, '.neon-alert.json') : null;
 }
 // connection strings and passwords never reach the note
