@@ -5128,10 +5128,13 @@ hooksCmd.command('trajectory-end')
   .option('--success', 'Task succeeded')
   .option('--quality <quality>', 'Quality score (0-1)', '0.5')
   .option('--session <id>', 'Only this session\'s trajectory')
+  .option('--id <trajectory>', 'Exactly this open trajectory (a stale one, e.g. from before trajectories had a session)')
   .action((opts) => {
     const intel = new Intelligence({ skipEngine: true });  // Fast mode
     const trajectories = intel.data.activeTrajectories || {};
-    const latestTrajId = pickTrajectory(trajectories, opts.session);
+    // [neon-direct fork 2026-10-30] --id closes one named trajectory, whatever its session: the stale-trajectory tidy
+    // needs it for trajectories with no session field, which --session cannot reach
+    const latestTrajId = opts.id ? (trajectories[opts.id] ? opts.id : undefined) : pickTrajectory(trajectories, opts.session);
     if (!latestTrajId) {
       console.log(JSON.stringify({ success: false, error: 'No active trajectory' }));
       return;
