@@ -284,102 +284,103 @@ export function spectralClustering(graph: Graph, k: number = 2): SpectralResult 
  * Good for detecting natural module boundaries.
  */
 export function louvainCommunities(graph: Graph): Map<string, number> {
-  const communities = new Map<string, number>();
-  let communityId = 0;
-
-  // Initialize: each node in its own community
-  for (const node of graph.nodes) {
-    communities.set(node, communityId++);
-  }
-
-  // Total edge weight
-  let m = 0;
-  for (const { weight = 1 } of graph.edges) {
-    m += weight;
-  }
-  m /= 2; // Undirected
-
-  if (m === 0) return communities;
-
-  // Node weights (sum of edge weights)
-  const nodeWeight = new Map<string, number>();
+  // Louvain done the standard way, both phases. The version before compared each
+  // neighbour community's gain with 0 without subtracting the loss of leaving its own (whose total still counted the
+  // node), so nodes swapped back and forth and the loop never ended (a 50-node graph ran forever); m was also halved
+  // twice, and there was no aggregation phase. Now: (1) local moving, a node REMOVED from its community before the gains
+  // are compared, moving only when another community beats its own; (2) the communities become single nodes and (1)
+  // runs again, until nothing merges. Pass and level caps guard the end.
+  const strength = new Map<string, number>();
+  let twoM = 0;
   for (const node of graph.nodes) {
     let w = 0;
-    for (const [, weight] of graph.adjacency.get(node) || []) {
-      w += weight;
-    }
-    nodeWeight.set(node, w);
+    for (const [neighbor, weight] of graph.adjacency.get(node) || []) if (neighbor !== node) w += weight;
+    strength.set(node, w);
+    twoM += w; // both directions are stored, so the sum of strengths is 2m
+  }
+  const member = new Map<string, string>(); // original node -> its node at the current level
+  for (const node of graph.nodes) member.set(node, node);
+  if (twoM === 0) {
+    const alone = new Map<string, number>();
+    graph.nodes.forEach((n, i) => alone.set(n, i));
+    return alone;
   }
 
-  // Community weights
-  const communityWeight = new Map<number, number>();
+  let nodes = [...graph.nodes];
+  let adj = graph.adjacency as Map<string, Map<string, number>>;
+  let k = strength;
+  for (let level = 0; level < 32; level++) {
+    const part = louvainLocalMoving(nodes, adj, k, twoM);
+    const count = new Set(part.values()).size;
+    if (count === nodes.length) break; // nothing merged: done
+    // aggregate: each community becomes one node; edges between communities summed (inside ones dropped: they no
+    // longer decide a move, and each node keeps its full strength in k)
+    const nextAdj = new Map<string, Map<string, number>>();
+    const nextK = new Map<string, number>();
+    const id = (c: number) => `L${level}c${c}`;
+    for (const u of nodes) {
+      const cu = id(part.get(u)!);
+      nextK.set(cu, (nextK.get(cu) || 0) + k.get(u)!);
+      if (!nextAdj.has(cu)) nextAdj.set(cu, new Map());
+      for (const [v, w] of adj.get(u) || []) {
+        const cv = id(part.get(v)!);
+        if (cv === cu) continue;
+        nextAdj.get(cu)!.set(cv, (nextAdj.get(cu)!.get(cv) || 0) + w);
+      }
+    }
+    for (const [orig, at] of member) member.set(orig, id(part.get(at)!));
+    nodes = [...nextK.keys()];
+    adj = nextAdj;
+    k = nextK;
+  }
+
+  // Number the final communities contiguously, in node order
+  const communities = new Map<string, number>();
+  const renumber = new Map<string, number>();
   for (const node of graph.nodes) {
-    const c = communities.get(node)!;
-    communityWeight.set(c, (communityWeight.get(c) || 0) + (nodeWeight.get(node) || 0));
+    const at = member.get(node)!;
+    if (!renumber.has(at)) renumber.set(at, renumber.size);
+    communities.set(node, renumber.get(at)!);
   }
-
-  // Iterate until no improvement
-  let improved = true;
-  while (improved) {
-    improved = false;
-
-    for (const node of graph.nodes) {
-      const currentCommunity = communities.get(node)!;
-      const ki = nodeWeight.get(node) || 0;
-
-      // Calculate modularity gain for moving to neighbor communities
-      let bestCommunity = currentCommunity;
-      let bestGain = 0;
-
-      const neighborCommunities = new Set<number>();
-      for (const [neighbor] of graph.adjacency.get(node) || []) {
-        neighborCommunities.add(communities.get(neighbor)!);
-      }
-
-      for (const targetCommunity of neighborCommunities) {
-        if (targetCommunity === currentCommunity) continue;
-
-        // Calculate edge weight to target community
-        let ki_in = 0;
-        for (const [neighbor, weight] of graph.adjacency.get(node) || []) {
-          if (communities.get(neighbor) === targetCommunity) {
-            ki_in += weight;
-          }
-        }
-
-        const sumTot = communityWeight.get(targetCommunity) || 0;
-        const gain = ki_in / m - (ki * sumTot) / (2 * m * m);
-
-        if (gain > bestGain) {
-          bestGain = gain;
-          bestCommunity = targetCommunity;
-        }
-      }
-
-      // Move node if beneficial
-      if (bestCommunity !== currentCommunity) {
-        communities.set(node, bestCommunity);
-
-        // Update community weights
-        communityWeight.set(currentCommunity, (communityWeight.get(currentCommunity) || 0) - ki);
-        communityWeight.set(bestCommunity, (communityWeight.get(bestCommunity) || 0) + ki);
-
-        improved = true;
-      }
-    }
-  }
-
-  // Renumber communities to be contiguous
-  const renumber = new Map<number, number>();
-  let newId = 0;
-  for (const [node, c] of communities) {
-    if (!renumber.has(c)) {
-      renumber.set(c, newId++);
-    }
-    communities.set(node, renumber.get(c)!);
-  }
-
   return communities;
+}
+
+/** Louvain phase 1 (local moving) on one level; returns each node's community. */
+function louvainLocalMoving(
+  nodes: string[],
+  adj: Map<string, Map<string, number>>,
+  k: Map<string, number>,
+  twoM: number
+): Map<string, number> {
+  const community = new Map<string, number>();
+  nodes.forEach((n, i) => community.set(n, i));
+  const tot = new Map<number, number>(); // Σ_tot: the summed strength of each community
+  for (const n of nodes) tot.set(community.get(n)!, k.get(n)!);
+  for (let pass = 0, improved = true; improved && pass < 100; pass++) {
+    improved = false;
+    for (const node of nodes) {
+      const own = community.get(node)!;
+      const ki = k.get(node)!;
+      const kIn = new Map<number, number>(); // edge weight from this node into each neighbouring community
+      for (const [neighbor, weight] of adj.get(node) || []) {
+        if (neighbor === node) continue;
+        const c = community.get(neighbor)!;
+        kIn.set(c, (kIn.get(c) || 0) + weight);
+      }
+      tot.set(own, tot.get(own)! - ki); // take the node out of its community
+      // gain of inserting it into c (up to a constant factor): k_i,in(c) - k_i * Σ_tot(c) / 2m
+      const gain = (c: number) => (kIn.get(c) || 0) - (ki * (tot.get(c) || 0)) / twoM;
+      let best = own;
+      let bestGain = gain(own);
+      for (const c of kIn.keys()) {
+        const g = gain(c);
+        if (g > bestGain + 1e-12) { best = c; bestGain = g; }
+      }
+      tot.set(best, (tot.get(best) || 0) + ki);
+      if (best !== own) { community.set(node, best); improved = true; }
+    }
+  }
+  return community;
 }
 
 /**
