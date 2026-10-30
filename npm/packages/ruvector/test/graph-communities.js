@@ -74,6 +74,74 @@ const cases = [
     assert.ok(!r.timedOut && !r.error, r.error || 'timed out');
     assert.deepEqual(r, { same: true });
   }],
+  ['louvain: three disconnected pairs are three communities; heavy edges decide when weights differ', () => {
+    const r = inChild(`(g) => {
+      const label = (c) => JSON.stringify([...c.values()]);
+      const pairs = g.louvainCommunities(g.buildGraph(['a', 'b', 'c', 'd', 'e', 'f'], [{ from: 'a', to: 'b' }, { from: 'c', to: 'd' }, { from: 'e', to: 'f' }]));
+      const w = g.louvainCommunities(g.buildGraph(['a', 'b', 'c', 'd'], [{ from: 'a', to: 'b', weight: 10 }, { from: 'c', to: 'd', weight: 10 }, { from: 'b', to: 'c', weight: 1 }]));
+      return { pairs: label(pairs), weighted: label(w) }; }`);
+    assert.ok(!r.timedOut && !r.error, r.error || 'timed out');
+    assert.deepEqual(r, { pairs: '[0,0,1,1,2,2]', weighted: '[0,0,1,1]' });
+  }],
+  ['louvain: empty graph, self-loop, duplicate edges and an edge to an unlisted node give every listed node a label 0..k-1', () => {
+    const r = inChild(`(g) => {
+      const ok = (nodes, c) => nodes.every((n) => Number.isInteger(c.get(n))) && [...new Set(c.values())].sort((a, b) => a - b).every((v, i) => v === i);
+      const cases = [
+        [[], []],
+        [['a', 'b'], [{ from: 'a', to: 'a' }, { from: 'a', to: 'b' }]],
+        [['a', 'b', 'c'], [{ from: 'a', to: 'b' }, { from: 'a', to: 'b' }, { from: 'b', to: 'c' }]],
+        [['a', 'b'], [{ from: 'a', to: 'b' }, { from: 'a', to: 'z' }]],
+      ];
+      return cases.map(([n, e]) => ok(n, g.louvainCommunities(g.buildGraph(n, e)))); }`);
+    assert.ok(!r.timedOut && !r.error, r.error || 'timed out');
+    assert.deepEqual(r, [true, true, true, true]);
+  }],
+  ['louvain on 12 random planted graphs (30–120 nodes, 2–4 groups): modularity at least the planted partition', () => {
+    const r = inChild(`(g, planted) => {
+      const out = [];
+      for (let t = 0; t < 12; t++) {
+        const k = 2 + (t % 3), n = k * (10 + 3 * t);
+        const p = planted(n, k, 101 + t), graph = g.buildGraph(p.nodes, p.edges);
+        const c = g.louvainCommunities(graph);
+        const found = {}; for (const [node, l] of c) (found[l] = found[l] || []).push(node);
+        const plantedGroups = Array.from({ length: k }, (_, j) => p.nodes.filter((_, i) => p.group(i) === j));
+        out.push(g.calculateModularity(graph, Object.values(found)) >= g.calculateModularity(graph, plantedGroups) - 1e-9);
+      }
+      return out; }`, 20000);
+    assert.ok(!r.timedOut && !r.error, r.error || 'timed out');
+    assert.deepEqual(r, Array(12).fill(true));
+  }],
+  ['spectral: two disconnected triangles split exactly; eigenvalues ascending within [0, 2]', () => {
+    const r = inChild(`(g) => {
+      const s = g.spectralClustering(g.buildGraph(['a', 'b', 'c', 'd', 'e', 'f'],
+        [{ from: 'a', to: 'b' }, { from: 'b', to: 'c' }, { from: 'c', to: 'a' }, { from: 'd', to: 'e' }, { from: 'e', to: 'f' }, { from: 'f', to: 'd' }]), 2);
+      const l = ['a', 'b', 'c', 'd', 'e', 'f'].map((n) => s.clusters.get(n));
+      const ev = s.eigenvalues;
+      return { split: l[0] === l[1] && l[1] === l[2] && l[3] === l[4] && l[4] === l[5] && l[0] !== l[3],
+               eigen: ev.every((v, i) => v >= -1e-9 && v <= 2 + 1e-9 && (i === 0 || v >= ev[i - 1] - 1e-9)) }; }`);
+    assert.ok(!r.timedOut && !r.error, r.error || 'timed out');
+    assert.deepEqual(r, { split: true, eigen: true });
+  }],
+  ['spectral: empty graph, k = 1, k > n, an isolated node and an edge to an unlisted node', () => {
+    const r = inChild(`(g) => {
+      const S = (n, e, k) => g.spectralClustering(g.buildGraph(n, e), k).clusters;
+      const empty = S([], [], 2).size;
+      const one = new Set(S(['a', 'b', 'c'], [{ from: 'a', to: 'b' }], 1).values()).size;
+      const big = S(['a', 'b'], [{ from: 'a', to: 'b' }], 5);
+      const iso = S(['a', 'b', 'c'], [{ from: 'a', to: 'b' }], 2);
+      const unk = S(['a', 'b'], [{ from: 'a', to: 'b' }, { from: 'a', to: 'z' }], 2);
+      return { empty, one, bigLabelled: big.size === 2, isolatedApart: iso.get('a') === iso.get('b') && iso.get('c') !== iso.get('a'), unknownIgnored: unk.size === 2 && !unk.has('z') }; }`);
+    assert.ok(!r.timedOut && !r.error, r.error || 'timed out');
+    assert.deepEqual(r, { empty: 0, one: 1, bigLabelled: true, isolatedApart: true, unknownIgnored: true });
+  }],
+  ['minCut: two triangles joined by one edge are cut at that edge (weight 1)', () => {
+    const r = inChild(`(g) => {
+      const m = g.minCut(g.buildGraph(['a', 'b', 'c', 'd', 'e', 'f'], [{ from: 'a', to: 'b' }, { from: 'b', to: 'c' }, { from: 'c', to: 'a' },
+        { from: 'd', to: 'e' }, { from: 'e', to: 'f' }, { from: 'f', to: 'd' }, { from: 'c', to: 'd' }]));
+      return { groups: m.groups.map((x) => [...x].sort().join('')).sort(), cut: m.cutWeight }; }`);
+    assert.ok(!r.timedOut && !r.error, r.error || 'timed out');
+    assert.deepEqual(r, { groups: ['abc', 'def'], cut: 1 });
+  }],
 ];
 
 const failures = [];

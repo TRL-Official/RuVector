@@ -337,6 +337,18 @@ test('hooks graph-mincut returns a partition', () => withImportGroups((cwd, file
   assert.strictEqual(j.success, true, j.error);
   assert.strictEqual(j.nodes, 12);
   assert(Array.isArray(j.groups) && j.groups.length === 2, 'Should return two groups');
+  assert(j.groups.every(sameGroup), 'The cut should separate the two import groups');
+  assert.strictEqual(j.cutWeight, 1, 'Only the one import across the groups should be cut');
+}));
+
+test('hooks graph-mincut / graph-cluster: one file, a missing file, a file with no imports', () => withImportGroups((cwd) => {
+  fs.writeFileSync(path.join(cwd, 'alone.ts'), 'export const x = 1;\n');
+  const one = lastJson(run('hooks graph-mincut alone.ts', { cwd }));
+  assert.strictEqual(one.success, true, one.error);
+  assert.strictEqual(one.nodes, 1);
+  const missing = lastJson(run('hooks graph-cluster m0.ts m1.ts does-not-exist.ts alone.ts', { cwd }));
+  assert.strictEqual(missing.success, true, missing.error);
+  assert(Array.isArray(missing.communities), 'Should still return communities');
 }));
 
 test('hooks graph-cluster (louvain) finds the two import groups', () => withImportGroups((cwd, files) => {
@@ -369,6 +381,16 @@ test('hooks build-agents --output <absolute dir> writes there and leaves the pro
     run('hooks build-agents --output .claude/agents-test --format json', { cwd: project, timeout: 60000 });
     assert.strictEqual(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).agentConfig.directory, path.join('.claude', 'agents-test'),
       'An output inside the project is recorded as a relative directory');
+    // an absolute path that is inside the project is recorded relative to it
+    run(`hooks build-agents --output "${path.join(project, 'agents-abs')}" --format json`, { cwd: project, timeout: 60000 });
+    assert.strictEqual(JSON.parse(fs.readFileSync(settingsPath, 'utf8')).agentConfig.directory, 'agents-abs',
+      'An absolute output inside the project is recorded as a relative directory');
+    // a relative path that leaves the project is outside it: settings untouched
+    const escape = path.join('..', path.basename(outDir), 'escaped');
+    const before = fs.readFileSync(settingsPath, 'utf8');
+    run(`hooks build-agents --output "${escape}" --format json`, { cwd: project, timeout: 60000 });
+    assert(fs.existsSync(path.join(outDir, 'escaped')), 'The relative path is resolved against the project');
+    assert.strictEqual(fs.readFileSync(settingsPath, 'utf8'), before, 'An output that leaves the project must not touch its settings.json');
   } finally {
     fs.rmSync(project, { recursive: true, force: true });
     fs.rmSync(outDir, { recursive: true, force: true });
