@@ -170,110 +170,82 @@ export function minCut(graph: Graph): Partition {
  * Good for finding natural clusters in code dependencies.
  */
 export function spectralClustering(graph: Graph, k: number = 2): SpectralResult {
+  // Spectral clustering uses the eigenvectors of the normalized Laplacian
+  // L = I - D^(-1/2) A D^(-1/2) with the SMALLEST eigenvalues (they vary slowly inside a well-connected group). Plain power
+  // iteration on L converges to the LARGEST ones, so the clusters ignored the groups (two planted groups came out mixed).
+  // Now: power iteration on M = 2I - L (same eigenvectors, order reversed), starting from L's known first eigenvector
+  // D^(1/2)·1, rows normalized (Ng–Jordan–Weiss), and a deterministic k-means start (farthest point), so a run is repeatable.
   const n = graph.nodes.length;
   const nodeIndex = new Map(graph.nodes.map((node, i) => [node, i]));
   const clusters = new Map<string, number>();
-
   if (n === 0) {
     return { clusters, eigenvalues: [], coordinates: new Map() };
   }
 
-  // Build Laplacian matrix (D - A)
   const degree = new Float64Array(n);
-  const laplacian: number[][] = Array(n).fill(null).map(() => Array(n).fill(0));
-
+  const A: Array<Array<[number, number]>> = Array.from({ length: n }, () => []);
   for (const [node, neighbors] of graph.adjacency) {
-    const i = nodeIndex.get(node)!;
-    let d = 0;
+    const i = nodeIndex.get(node);
+    if (i === undefined) continue;
     for (const [neighbor, weight] of neighbors) {
-      const j = nodeIndex.get(neighbor)!;
-      laplacian[i][j] = -weight;
-      d += weight;
-    }
-    degree[i] = d;
-    laplacian[i][i] = d;
-  }
-
-  // Normalized Laplacian: D^(-1/2) L D^(-1/2)
-  for (let i = 0; i < n; i++) {
-    for (let j = 0; j < n; j++) {
-      if (degree[i] > 0 && degree[j] > 0) {
-        laplacian[i][j] /= Math.sqrt(degree[i] * degree[j]);
-      }
+      const j = nodeIndex.get(neighbor);
+      if (j === undefined || j === i) continue;
+      A[i].push([j, weight]);
+      degree[i] += weight;
     }
   }
+  const invSqrt = Float64Array.from(degree, (d) => (d > 0 ? 1 / Math.sqrt(d) : 0));
+  // y = M x = 2x - L x = x + D^(-1/2) A D^(-1/2) x   (an isolated node has L_ii = 0, so M_ii = 2)
+  const applyM = (x: Float64Array) => {
+    const y = new Float64Array(n);
+    for (let i = 0; i < n; i++) {
+      let s = degree[i] > 0 ? x[i] : 2 * x[i];
+      for (const [j, w] of A[i]) s += invSqrt[i] * w * invSqrt[j] * x[j];
+      y[i] = s;
+    }
+    return y;
+  };
+  const rayleighL = (x: Float64Array) => { const y = applyM(x); return 2 - dotProduct(x, y); };
+  const deflate = (v: Float64Array, basis: Float64Array[]) => {
+    for (const b of basis) { const d = dotProduct(v, b); for (let i = 0; i < n; i++) v[i] -= d * b[i]; }
+  };
 
-  // Power iteration to find eigenvectors
-  const eigenvectors: number[][] = [];
+  const m = Math.min(k, n);
+  const basis: Float64Array[] = [];
   const eigenvalues: number[] = [];
-
-  for (let ev = 0; ev < Math.min(k, n); ev++) {
-    let vector = new Float64Array(n);
-    for (let i = 0; i < n; i++) {
-      vector[i] = Math.random();
+  // L's first eigenvector is D^(1/2)·1 (eigenvalue 0) when there are edges
+  const first = Float64Array.from(degree, (d) => Math.sqrt(d));
+  if (dotProduct(first, first) > 0) { normalize(first); basis.push(first); eigenvalues.push(rayleighL(first)); }
+  let seed = 12345;
+  const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 - 0.5; };
+  while (basis.length < m) {
+    let v = Float64Array.from({ length: n }, rand);
+    deflate(v, basis); normalize(v);
+    for (let iter = 0; iter < 500; iter++) {
+      const next = applyM(v);
+      deflate(next, basis); normalize(next);
+      let diff = 0; for (let i = 0; i < n; i++) diff = Math.max(diff, Math.abs(next[i] - v[i]));
+      v = next;
+      if (diff < 1e-10) break;
     }
-    normalize(vector);
-
-    // Deflation: orthogonalize against previous eigenvectors
-    for (const prev of eigenvectors) {
-      const dot = dotProduct(vector, new Float64Array(prev));
-      for (let i = 0; i < n; i++) {
-        vector[i] -= dot * prev[i];
-      }
-    }
-    normalize(vector);
-
-    // Power iteration
-    for (let iter = 0; iter < 100; iter++) {
-      const newVector = new Float64Array(n);
-      for (let i = 0; i < n; i++) {
-        for (let j = 0; j < n; j++) {
-          newVector[i] += laplacian[i][j] * vector[j];
-        }
-      }
-
-      // Deflation
-      for (const prev of eigenvectors) {
-        const dot = dotProduct(newVector, new Float64Array(prev));
-        for (let i = 0; i < n; i++) {
-          newVector[i] -= dot * prev[i];
-        }
-      }
-
-      normalize(newVector);
-      vector = newVector;
-    }
-
-    // Compute eigenvalue
-    let eigenvalue = 0;
-    for (let i = 0; i < n; i++) {
-      let sum = 0;
-      for (let j = 0; j < n; j++) {
-        sum += laplacian[i][j] * vector[j];
-      }
-      eigenvalue += vector[i] * sum;
-    }
-
-    eigenvectors.push(Array.from(vector));
-    eigenvalues.push(eigenvalue);
+    basis.push(v);
+    eigenvalues.push(rayleighL(v));
   }
 
-  // K-means clustering on eigenvector coordinates
   const coordinates = new Map<string, number[]>();
+  const rows: number[][] = [];
   for (let i = 0; i < n; i++) {
-    coordinates.set(graph.nodes[i], eigenvectors.map(ev => ev[i]));
+    const row = basis.map((b) => b[i]);
+    const len = Math.sqrt(row.reduce((a, x) => a + x * x, 0));
+    const unit = len > 0 ? row.map((x) => x / len) : row;
+    rows.push(unit);
+    coordinates.set(graph.nodes[i], unit);
   }
 
-  // Simple k-means
-  const clusterAssignment = kMeans(
-    graph.nodes.map(node => coordinates.get(node)!),
-    k
-  );
-
+  const clusterAssignment = kMeans(rows, k);
   for (let i = 0; i < n; i++) {
     clusters.set(graph.nodes[i], clusterAssignment[i]);
   }
-
   return { clusters, eigenvalues, coordinates };
 }
 
@@ -543,15 +515,17 @@ function kMeans(points: number[][], k: number, maxIter: number = 100): number[] 
 
   const dim = points[0].length;
 
-  // Random initialization
-  const centroids: number[][] = [];
-  const used = new Set<number>();
+  // deterministic farthest-point initialization (it was random: a run could differ from
+  // the last, and two starting points in one group split that group)
+  const dist2 = (a: number[], b: number[]) => a.reduce((s, x, d) => s + (x - b[d]) * (x - b[d]), 0);
+  const centroids: number[][] = [[...points[0]]];
   while (centroids.length < Math.min(k, n)) {
-    const idx = Math.floor(Math.random() * n);
-    if (!used.has(idx)) {
-      used.add(idx);
-      centroids.push([...points[idx]]);
+    let best = 0, bestD = -1;
+    for (let i = 0; i < n; i++) {
+      const d = Math.min(...centroids.map((c) => dist2(points[i], c)));
+      if (d > bestD) { bestD = d; best = i; }
     }
+    centroids.push([...points[best]]);
   }
 
   const assignment = new Array(n).fill(0);
