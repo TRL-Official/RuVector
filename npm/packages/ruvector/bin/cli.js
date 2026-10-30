@@ -5599,7 +5599,9 @@ hooksCmd.command('graph-cluster')
       const graph = graphMod.buildGraph(nodes, edges);
       let result;
       if (opts.method === 'spectral') {
-        result = graphMod.spectralClustering(graph, parseInt(opts.clusters));
+        // [neon-direct fork fix 2026-10-30] clusters and coordinates are Maps, which JSON prints as {}: plain objects
+        const sp = graphMod.spectralClustering(graph, parseInt(opts.clusters));
+        result = { clusters: Object.fromEntries(sp.clusters), eigenvalues: sp.eigenvalues, coordinates: Object.fromEntries(sp.coordinates) };
       } else {
         const byCommunity = new Map();
         for (const [node, c] of graphMod.louvainCommunities(graph)) byCommunity.set(c, [...(byCommunity.get(c) || []), node]);
