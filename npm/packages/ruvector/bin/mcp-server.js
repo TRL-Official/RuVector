@@ -2411,6 +2411,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'hooks_memory_get': {
+        if (RVN_ON) return jsonResult({ success: false, error: `hooks_memory_get: ` + 'not available in neon-direct mode: memories live in Neon (never loaded whole), so this command would see none of them; read them with digital-twin\'s mem-bridge.mjs recall; an edit or delete needs the operator' }, true); // [neon-direct]
         try {
           const memory = memoryStore.getMemory(intel.data, args.id);
           return memory ? jsonResult({ success: true, memory }) : jsonResult({ success: false, error: `memory not found: ${args.id}` }, true);
@@ -2418,6 +2419,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'hooks_memory_list': {
+        if (RVN_ON) return jsonResult({ success: false, error: `hooks_memory_list: ` + 'not available in neon-direct mode: memories live in Neon (never loaded whole), so this command would see none of them; read them with digital-twin\'s mem-bridge.mjs recall; an edit or delete needs the operator' }, true); // [neon-direct]
         try {
           const type = args.type !== undefined ? memoryStore.validateMemoryType(args.type) : undefined;
           return jsonResult({ success: true, ...memoryStore.listMemories(intel.data, { type, limit: args.limit, offset: args.offset }) });
@@ -2425,6 +2427,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'hooks_memory_update': {
+        if (RVN_ON) return jsonResult({ success: false, error: `hooks_memory_update: ` + 'not available in neon-direct mode: memories live in Neon (never loaded whole), so this command would see none of them; read them with digital-twin\'s mem-bridge.mjs recall; an edit or delete needs the operator' }, true); // [neon-direct]
         try {
           const patch = {};
           for (const k of ['content', 'type', 'metadata']) if (args[k] !== undefined) patch[k] = args[k];
@@ -2434,6 +2437,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'hooks_forget': {
+        if (RVN_ON) return jsonResult({ success: false, error: `hooks_forget: ` + 'not available in neon-direct mode: memories live in Neon (never loaded whole), so this command would see none of them; read them with digital-twin\'s mem-bridge.mjs recall; an edit or delete needs the operator' }, true); // [neon-direct]
         try {
           const result = intel.forgetMemories(recordValidate.validateIdList(args.ids, 'ids'));
           return jsonResult({ success: result.deleted.length > 0, ...result }, result.deleted.length === 0);
