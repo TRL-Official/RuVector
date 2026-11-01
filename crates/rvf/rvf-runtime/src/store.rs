@@ -40,7 +40,13 @@ use crate::options::*;
 use crate::rabitq_path::RabitqState;
 use crate::read_path::{self, VectorData};
 use crate::status::{CompactionState, StoreStatus};
-use crate::write_path::SegmentWriter;
+use crate::write_path::{self, SegmentWriter};
+
+mod policy_api;
+mod security;
+mod stream_support;
+pub use security::security_error_code;
+use security::SecurityState;
 
 /// Helper to convert any error into an RvfError with the given code.
 fn err(code: ErrorCode) -> RvfError {
@@ -158,6 +164,8 @@ pub struct RvfStore {
     /// Generations dropped by open because the chain could not be replayed
     /// past them (see [`Self::metadata_recovery`]).
     dropped_metadata_generations: u64,
+    /// Evidence about bytes ignored after the served manifest (#1276).
+    tail_recovery: TailRecovery,
     /// Records the truncated replay resurrected and open therefore discarded.
     dropped_metadata_records: u64,
     /// `META_SEG` offsets a truncated replay could not reach. They are dropped
@@ -202,6 +210,8 @@ pub struct RvfStore {
     /// stores and until the first COW query on a child. Boxed to break the
     /// recursive type; `Mutex` so `query(&self)` can populate it lazily.
     parent_store: Mutex<Option<Box<RvfStore>>>,
+    /// Security policy state (ADR-033 section 4, ADR-354 item 5).
+    security: SecurityState,
 }
 
 /// Clears an `AtomicBool` on drop, so a panicking index build can never
@@ -217,7 +227,18 @@ impl Drop for ClearOnDrop<'_> {
 
 impl RvfStore {
     /// Create a new RVF store at the given path.
+    ///
+    /// The file is unsigned: this is the `Permissive` creation path. Use
+    /// [`RvfStore::create_signed`] for a store `Strict` will accept.
     pub fn create(path: &Path, options: RvfOptions) -> Result<Self, RvfError> {
+        Self::create_inner(path, options, None)
+    }
+
+    fn create_inner(
+        path: &Path,
+        options: RvfOptions,
+        signing_key: Option<[u8; 32]>,
+    ) -> Result<Self, RvfError> {
         if options.dimension == 0 {
             return Err(err(ErrorCode::InvalidManifest));
         }
@@ -258,6 +279,7 @@ impl RvfStore {
             committed_metadata: MetadataStore::new(),
             committed_file_metadata: BTreeMap::new(),
             dropped_metadata_generations: 0,
+            tail_recovery: TailRecovery::default(),
             dropped_metadata_records: 0,
             orphaned_metadata_offsets: Vec::new(),
             embedding_compatibility: EmbeddingCompatibility::Unchecked,
@@ -278,8 +300,14 @@ impl RvfStore {
             rabitq: Mutex::new(None),
             rabitq_building: AtomicBool::new(false),
             parent_store: Mutex::new(None),
+            security: signing_key.map_or_else(SecurityState::permissive, SecurityState::signer),
         };
 
+        if signing_key.is_some() {
+            if let Some(w) = store.seg_writer.as_mut() {
+                w.use_cryptographic_hash();
+            }
+        }
         store.write_manifest()?;
         Ok(store)
     }
@@ -295,7 +323,13 @@ impl RvfStore {
     /// dropped generations or records. The next metadata write re-anchors the
     /// chain on the recovered state, and `compact()` reclaims the unreachable
     /// bytes.
+    ///
+    /// Nothing is verified (`Permissive`); see [`RvfStore::open_with_policy`].
     pub fn open(path: &Path) -> Result<Self, RvfError> {
+        Self::open_inner(path, SecurityState::permissive())
+    }
+
+    fn open_inner(path: &Path, security: SecurityState) -> Result<Self, RvfError> {
         if !path.exists() {
             return Err(err(ErrorCode::ManifestNotFound));
         }
@@ -334,6 +368,7 @@ impl RvfStore {
             committed_metadata: MetadataStore::new(),
             committed_file_metadata: BTreeMap::new(),
             dropped_metadata_generations: 0,
+            tail_recovery: TailRecovery::default(),
             dropped_metadata_records: 0,
             orphaned_metadata_offsets: Vec::new(),
             embedding_compatibility: EmbeddingCompatibility::Unchecked,
@@ -354,6 +389,7 @@ impl RvfStore {
             rabitq: Mutex::new(None),
             rabitq_building: AtomicBool::new(false),
             parent_store: Mutex::new(None),
+            security,
         };
 
         store.boot()?;
@@ -372,6 +408,14 @@ impl RvfStore {
     fn open_readonly_with_ancestry(
         path: &Path,
         ancestry: &mut HashSet<PathBuf>,
+    ) -> Result<Self, RvfError> {
+        Self::open_readonly_inner(path, ancestry, SecurityState::permissive())
+    }
+
+    fn open_readonly_inner(
+        path: &Path,
+        ancestry: &mut HashSet<PathBuf>,
+        security: SecurityState,
     ) -> Result<Self, RvfError> {
         if !path.exists() {
             return Err(err(ErrorCode::ManifestNotFound));
@@ -411,6 +455,7 @@ impl RvfStore {
             committed_metadata: MetadataStore::new(),
             committed_file_metadata: BTreeMap::new(),
             dropped_metadata_generations: 0,
+            tail_recovery: TailRecovery::default(),
             dropped_metadata_records: 0,
             orphaned_metadata_offsets: Vec::new(),
             embedding_compatibility: EmbeddingCompatibility::Unchecked,
@@ -431,6 +476,7 @@ impl RvfStore {
             rabitq: Mutex::new(None),
             rabitq_building: AtomicBool::new(false),
             parent_store: Mutex::new(None),
+            security,
         };
 
         let boot_result = store.boot_with_ancestry(ancestry);
@@ -472,7 +518,7 @@ impl RvfStore {
         ids: &[u64],
         metadata: IngestMetadata<'_>,
     ) -> Result<IngestResult, RvfError> {
-        if self.read_only {
+        if self.is_write_blocked() {
             return Err(err(ErrorCode::ReadOnly));
         }
         if self.embedding_compatibility == EmbeddingCompatibility::VectorReadOnly {
@@ -490,7 +536,9 @@ impl RvfStore {
         let mut valid_ids: Vec<u64> = Vec::with_capacity(ids.len());
 
         for (i, &vec_data) in vectors.iter().enumerate() {
-            if vec_data.len() != dim {
+            // Non-finite components poison every distance: reject the row
+            // like a dimension mismatch (#1276 review).
+            if vec_data.len() != dim || vec_data.iter().any(|x| !x.is_finite()) {
                 rejected += 1;
                 continue;
             }
@@ -500,7 +548,8 @@ impl RvfStore {
         }
 
         if valid_vectors.is_empty() {
-            self.epoch += 1;
+            // Nothing was accepted, so nothing was written: the epoch must not
+            // advance (#1276 item 4).
             return Ok(IngestResult {
                 accepted: 0,
                 rejected,
@@ -524,7 +573,6 @@ impl RvfStore {
         let old_chain = self.metadata_chain;
         let old_directory = self.segment_dir.clone();
         let old_epoch = self.epoch;
-        let old_witness_hash = self.last_witness_hash;
 
         let candidate_metadata = self.build_ingest_metadata(&metadata, &valid_ids)?;
         let has_metadata = !matches!(metadata, IngestMetadata::None);
@@ -535,10 +583,7 @@ impl RvfStore {
             .ok_or_else(|| err(ErrorCode::InvalidManifest))?;
 
         let (vec_seg_id, vec_seg_offset) = {
-            let mut buf_writer = BufWriter::with_capacity(256 * 1024, &self.file);
-            buf_writer
-                .seek(SeekFrom::End(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            let mut buf_writer = Self::append_cursor(&self.file, &self.security)?;
             let written = writer
                 .write_vec_seg(
                     &mut buf_writer,
@@ -568,6 +613,12 @@ impl RvfStore {
         for (vec_data, &vec_id) in valid_vectors.iter().zip(valid_ids.iter()) {
             self.vectors.insert_slice(vec_id, vec_data);
         }
+
+        // Re-inserting an id resurrects it. A deletion tombstones the payload that
+        // was there, it does not retire the identifier, so the bit must not outlive
+        // the vector it condemned. Left set, it hides the new vector from every
+        // query, and compact() reads it as dead and physically drops it.
+        self.deletion_bitmap.clear_ids(&valid_ids);
 
         // Keep the in-memory HNSW index in sync with the new vectors.
         {
@@ -634,7 +685,6 @@ impl RvfStore {
                 self.metadata_chain = old_chain;
                 self.segment_dir = old_directory;
                 self.epoch = old_epoch;
-                self.last_witness_hash = old_witness_hash;
                 *self.index.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 *self.rabitq.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 return Err(error);
@@ -647,7 +697,6 @@ impl RvfStore {
             self.metadata_chain = old_chain;
             self.segment_dir = old_directory;
             self.epoch = old_epoch;
-            self.last_witness_hash = old_witness_hash;
             *self.index.lock().unwrap_or_else(|e| e.into_inner()) = None;
             *self.rabitq.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return Err(error);
@@ -678,8 +727,33 @@ impl RvfStore {
         options: &QueryOptions,
     ) -> Result<Vec<SearchResult>, RvfError> {
         let (mut results, _) = self.query_routed(vector, k, options)?;
+        Self::check_results_finite(&results)?;
         self.attach_metadata(&mut results, options);
         Ok(results)
+    }
+
+    /// A finite query can still overflow (e.g. components near `f32::MAX`) so
+    /// that distances are inf/NaN and cannot be ranked; refuse rather than
+    /// return an arbitrary order. (Also guards stores that already hold
+    /// non-finite vectors ingested before ingest rejected them.)
+    fn check_results_finite(results: &[SearchResult]) -> Result<(), RvfError> {
+        if results.iter().any(|r| !r.distance.is_finite()) {
+            return Err(err(ErrorCode::NonFiniteQuery));
+        }
+        Ok(())
+    }
+
+    /// Validate a query vector at the API boundary: right dimension, and every
+    /// component finite. NaN or infinite components make every distance NaN
+    /// (or infinite) and used to be returned as ordinary results (#1276).
+    fn check_query_vector(&self, vector: &[f32]) -> Result<(), RvfError> {
+        if vector.len() != self.options.dimension as usize {
+            return Err(err(ErrorCode::DimensionMismatch));
+        }
+        if vector.iter().any(|x| !x.is_finite()) {
+            return Err(err(ErrorCode::NonFiniteQuery));
+        }
+        Ok(())
     }
 
     /// Populate [`SearchResult::metadata`] on each hit when the query opted
@@ -708,10 +782,7 @@ impl RvfStore {
         k: usize,
         options: &QueryOptions,
     ) -> Result<(Vec<SearchResult>, bool), RvfError> {
-        let dim = self.options.dimension as usize;
-        if vector.len() != dim {
-            return Err(err(ErrorCode::DimensionMismatch));
-        }
+        self.check_query_vector(vector)?;
 
         // COW children may have zero child-side vectors but still need parent
         // read-through; only skip early for non-COW empty stores.
@@ -1292,10 +1363,7 @@ impl RvfStore {
         use std::time::Instant;
 
         let start = Instant::now();
-        let dim = self.options.dimension as usize;
-        if vector.len() != dim {
-            return Err(err(ErrorCode::DimensionMismatch));
-        }
+        self.check_query_vector(vector)?;
 
         // Determine effective budget based on quality preference.
         let budget = match options.quality_preference {
@@ -1306,6 +1374,7 @@ impl RvfStore {
 
         // Execute the base query, tracking whether the HNSW index served it.
         let (results, index_used) = self.query_routed(vector, k, options)?;
+        Self::check_results_finite(&results)?;
         let hnsw_candidate_count = results.len() as u32;
 
         // Determine if safety net should activate.
@@ -1426,7 +1495,7 @@ impl RvfStore {
     ) -> Result<Vec<SearchResult>, RvfError> {
         let results = self.query(vector, k, options)?;
 
-        if self.options.witness.audit_queries && !self.read_only {
+        if self.options.witness.audit_queries && !self.is_write_blocked() {
             let action = format!(
                 "query:k={},results={},epoch={}",
                 k,
@@ -1434,11 +1503,18 @@ impl RvfStore {
                 self.epoch
             );
             self.append_witness(witness_types::COMPUTATION, action.as_bytes())?;
-            // Flush the witness to disk but skip a full manifest rewrite
-            // to keep query overhead minimal.
-            self.file
-                .sync_all()
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            if self.security.signing_key.is_some() {
+                // A signed store lists the witness in the signed directory
+                // (a trailing unlisted segment would be indistinguishable
+                // from an injected one); costs a manifest rewrite per audit.
+                self.write_manifest()?;
+            } else {
+                // Flush the witness to disk but skip a full manifest rewrite
+                // to keep query overhead minimal.
+                self.file
+                    .sync_all()
+                    .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            }
         }
 
         Ok(results)
@@ -1446,7 +1522,7 @@ impl RvfStore {
 
     /// Soft-delete vectors by ID.
     pub fn delete(&mut self, ids: &[u64]) -> Result<DeleteResult, RvfError> {
-        if self.read_only {
+        if self.is_write_blocked() {
             return Err(err(ErrorCode::ReadOnly));
         }
         if self.embedding_compatibility == EmbeddingCompatibility::VectorReadOnly {
@@ -1460,10 +1536,7 @@ impl RvfStore {
         let epoch = self.epoch + 1;
 
         let (journal_seg_id, journal_offset) = {
-            let mut buf_writer = BufWriter::new(&self.file);
-            buf_writer
-                .seek(SeekFrom::End(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            let mut buf_writer = Self::append_cursor(&self.file, &self.security)?;
             let written = writer
                 .write_journal_seg(&mut buf_writer, ids, epoch)
                 .map_err(|_| err(ErrorCode::FsyncFailed))?;
@@ -1497,7 +1570,6 @@ impl RvfStore {
         let old_deletion_bitmap = self.deletion_bitmap.clone();
         let old_membership_filter = self.membership_filter.clone();
         let old_epoch = self.epoch;
-        let old_witness_hash = self.last_witness_hash;
 
         let mut deleted = 0u64;
         for &id in ids {
@@ -1544,7 +1616,6 @@ impl RvfStore {
             self.deletion_bitmap = old_deletion_bitmap;
             self.membership_filter = old_membership_filter;
             self.epoch = old_epoch;
-            self.last_witness_hash = old_witness_hash;
             return Err(error);
         }
         self.commit_metadata_state();
@@ -1557,7 +1628,7 @@ impl RvfStore {
 
     /// Soft-delete vectors matching a filter expression.
     pub fn delete_by_filter(&mut self, filter_expr: &FilterExpr) -> Result<DeleteResult, RvfError> {
-        if self.read_only {
+        if self.is_write_blocked() {
             return Err(err(ErrorCode::ReadOnly));
         }
 
@@ -1614,9 +1685,18 @@ impl RvfStore {
     /// to maintain forward compatibility with segment types this version does
     /// not understand (e.g., future Kernel, Ebpf, or vendor-extension segments).
     pub fn compact(&mut self) -> Result<CompactionResult, RvfError> {
-        if self.read_only {
+        if self.is_write_blocked() {
             return Err(err(ErrorCode::ReadOnly));
         }
+
+        // Signed stores never trust file bytes during compaction (F-01/F-02):
+        // the segments to carry come from the directory only, each checked
+        // against the hash this handle committed to, before anything changes.
+        let signed_sources = if self.security.signing_key.is_some() {
+            Some(self.verified_compaction_sources()?)
+        } else {
+            None
+        };
 
         let deleted_ids = self.deletion_bitmap.to_sorted_ids();
         for &id in &deleted_ids {
@@ -1641,21 +1721,31 @@ impl RvfStore {
 
         // Read the entire original file into memory so we can scan for segments
         // that may not be in the manifest (e.g., unknown types appended by newer tools).
-        let original_bytes = {
-            let mut reader = BufReader::new(&self.file);
-            reader
-                .seek(SeekFrom::Start(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
-            let mut buf = Vec::new();
-            reader
-                .read_to_end(&mut buf)
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
-            buf
+        let (original_bytes, signed_preserved) = match signed_sources {
+            Some((bytes, list)) => (bytes, Some(list)),
+            None => {
+                let mut reader = BufReader::new(&self.file);
+                reader
+                    .seek(SeekFrom::Start(0))
+                    .map_err(|_| err(ErrorCode::FsyncFailed))?;
+                let mut buf = Vec::new();
+                reader
+                    .read_to_end(&mut buf)
+                    .map_err(|_| err(ErrorCode::FsyncFailed))?;
+                // A trailing Level-0 root page is not a segment.
+                let body_len = rvf_wire::tail_scan::split_root_page(&buf).0.len();
+                buf.truncate(body_len);
+                (buf, None)
+            }
         };
 
         let temp_path = self.path.with_extension("rvf.compact.tmp");
         let mut new_segment_dir = Vec::new();
+        let signing = self.security.signing_key.is_some();
         let mut seg_writer = SegmentWriter::new(1);
+        if signing {
+            seg_writer.use_cryptographic_hash();
+        }
         let keeps_metadata = !self.metadata.is_empty() || !self.file_metadata.is_empty();
         let mut compacted_metadata_bytes = 0usize;
         let compacted_generation = self
@@ -1700,8 +1790,17 @@ impl RvfStore {
             // original file. This includes both segments recorded in the old
             // manifest and segments appended after it (e.g., unknown types from
             // newer format versions).
-            let preserved = scan_preservable_segments(&original_bytes);
-            for (orig_offset, seg_id, payload_len, seg_type) in &preserved {
+            let preserved: Vec<(usize, u64, u64, u8, Option<[u8; 16]>)> = match &signed_preserved {
+                Some(list) => list
+                    .iter()
+                    .map(|&(o, i, l, t, h)| (o, i, l, t, Some(h)))
+                    .collect(),
+                None => scan_preservable_segments(&original_bytes)
+                    .into_iter()
+                    .map(|(o, i, l, t)| (o, i, l, t, None))
+                    .collect(),
+            };
+            for (orig_offset, seg_id, payload_len, seg_type, carried_hash) in &preserved {
                 // Drop INDEX_SEGs: compaction changes the vector set, so a
                 // preserved index would be stale. It is rebuilt from the
                 // live vectors on the next eligible query.
@@ -1727,17 +1826,20 @@ impl RvfStore {
                 };
                 let src = &original_bytes[*orig_offset..end];
 
-                // Flush the BufWriter so stream_position reflects the true offset.
+                // Copy verbatim at a 64-byte boundary (padding after), so a
+                // preserved legacy segment stays byte-identical and the
+                // rewritten file keeps a wire-aligned layout.
                 temp_writer
                     .flush()
                     .map_err(|_| err(ErrorCode::FsyncFailed))?;
-                let new_offset = temp_writer
-                    .stream_position()
+                let new_offset = seg_writer
+                    .copy_raw_segment(&mut temp_writer, src)
                     .map_err(|_| err(ErrorCode::FsyncFailed))?;
-
-                temp_writer
-                    .write_all(src)
-                    .map_err(|_| err(ErrorCode::FsyncFailed))?;
+                if let Some(h) = carried_hash {
+                    // Carry the hash that was committed and verified; it is
+                    // never recomputed from bytes read back from the file.
+                    seg_writer.record_hash(*seg_id, *h);
+                }
 
                 // Ensure the seg_writer's next_seg_id stays above any preserved ID.
                 while seg_writer.next_id() <= *seg_id {
@@ -1775,7 +1877,16 @@ impl RvfStore {
             temp_writer
                 .flush()
                 .map_err(|_| err(ErrorCode::FsyncFailed))?;
-            seg_writer
+            let hash_entries = if signing {
+                Some(
+                    seg_writer
+                        .hash_entries(&new_segment_dir)
+                        .ok_or_else(|| err(ErrorCode::InvalidManifest))?,
+                )
+            } else {
+                None
+            };
+            let (m_id, m_offset) = seg_writer
                 .write_manifest_seg_with_identity(
                     &mut temp_writer,
                     self.epoch,
@@ -1786,8 +1897,25 @@ impl RvfStore {
                     &new_segment_dir,
                     &empty_dels,
                     fi,
+                    hash_entries.as_deref(),
                 )
                 .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            if signing {
+                let len = write_path::manifest_payload_len(
+                    new_segment_dir.len(),
+                    0,
+                    fi.is_some(),
+                    hash_entries.as_ref().map(Vec::len),
+                );
+                self.security.last_manifest = Some(security::LastManifest {
+                    seg_id: m_id,
+                    offset: m_offset,
+                    len: SEGMENT_HEADER_SIZE as u64 + len,
+                    hash: seg_writer
+                        .hash_of(m_id)
+                        .ok_or_else(|| err(ErrorCode::InvalidManifest))?,
+                });
+            }
 
             temp_writer
                 .flush()
@@ -1812,6 +1940,10 @@ impl RvfStore {
             .write(true)
             .open(&self.path)
             .map_err(|_| err(ErrorCode::InvalidManifest))?;
+        // The rewritten file has no root page until it is re-sealed below.
+        self.security
+            .root_page_present
+            .store(false, Ordering::Release);
 
         self.metadata_chain = if keeps_metadata {
             MetadataChainState {
@@ -1828,19 +1960,30 @@ impl RvfStore {
         self.seg_writer = Some(seg_writer);
         self.last_compaction_time = now_secs();
 
-        // Reset witness chain after compaction (the file has been rewritten).
-        self.last_witness_hash = [0u8; 32];
+        // The witness chain is NOT reset: compaction preserves the existing
+        // WITNESS_SEGs in order, so the new entry continues the same chain.
 
         // Append a witness entry recording this compact operation.
+        let mut sealed = false;
         if self.options.witness.witness_compact {
             let action = format!(
                 "compact:segments_compacted={},bytes_reclaimed={},epoch={}",
                 segments_compacted, bytes_reclaimed, self.epoch
             );
             self.append_witness(witness_types::COMPUTATION, action.as_bytes())?;
-            self.file
-                .sync_all()
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            if self.security.signing_key.is_some() {
+                // List the witness in the signed directory (also re-seals).
+                self.write_manifest()?;
+                sealed = true;
+            } else {
+                self.file
+                    .sync_all()
+                    .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            }
+        }
+        if !sealed {
+            self.refresh_committed();
+            self.seal_root_page()?;
         }
 
         Ok(CompactionResult {
@@ -1885,7 +2028,7 @@ impl RvfStore {
     /// Persist the in-memory HNSW index as an INDEX_SEG if it has changed
     /// since it was last persisted (or since it was built/loaded).
     fn persist_index(&mut self) -> Result<(), RvfError> {
-        if self.read_only {
+        if self.is_write_blocked() {
             return Ok(());
         }
         let payload = {
@@ -1905,10 +2048,7 @@ impl RvfStore {
             .as_mut()
             .ok_or_else(|| err(ErrorCode::InvalidManifest))?;
         let (seg_id, seg_offset) = {
-            let mut buf_writer = BufWriter::with_capacity(256 * 1024, &self.file);
-            buf_writer
-                .seek(SeekFrom::End(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            let mut buf_writer = Self::append_cursor(&self.file, &self.security)?;
             let written = writer
                 .write_index_seg(&mut buf_writer, &payload)
                 .map_err(|_| err(ErrorCode::FsyncFailed))?;
@@ -1953,7 +2093,7 @@ impl RvfStore {
         api_port: u16,
         cmdline: Option<&str>,
     ) -> Result<u64, RvfError> {
-        if self.read_only {
+        if self.is_write_blocked() {
             return Err(err(ErrorCode::ReadOnly));
         }
 
@@ -1990,10 +2130,7 @@ impl RvfStore {
             .as_mut()
             .ok_or_else(|| err(ErrorCode::InvalidManifest))?;
         let (seg_id, seg_offset) = {
-            let mut buf_writer = BufWriter::new(&self.file);
-            buf_writer
-                .seek(SeekFrom::End(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            let mut buf_writer = Self::append_cursor(&self.file, &self.security)?;
             let written = writer
                 .write_kernel_seg(&mut buf_writer, &header_bytes, kernel_image, cmdline_bytes)
                 .map_err(|_| err(ErrorCode::FsyncFailed))?;
@@ -2036,7 +2173,7 @@ impl RvfStore {
         cmdline: Option<&str>,
         binding: &KernelBinding,
     ) -> Result<u64, RvfError> {
-        if self.read_only {
+        if self.is_write_blocked() {
             return Err(err(ErrorCode::ReadOnly));
         }
 
@@ -2085,10 +2222,7 @@ impl RvfStore {
             .ok_or_else(|| err(ErrorCode::InvalidManifest))?;
 
         let (seg_id, seg_offset) = {
-            let mut buf_writer = BufWriter::new(&self.file);
-            buf_writer
-                .seek(SeekFrom::End(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            let mut buf_writer = Self::append_cursor(&self.file, &self.security)?;
             // Write as raw kernel segment: the write_kernel_seg expects
             // header_bytes separately, but we need to include binding in
             // the "image" portion to keep the wire format correct.
@@ -2149,7 +2283,7 @@ impl RvfStore {
 
         let (_header, payload) = {
             let mut reader = BufReader::new(&self.file);
-            read_path::read_segment_payload(&mut reader, entry.1)
+            self.read_seg(&mut reader, entry.1)
                 .map_err(|_| err(ErrorCode::InvalidChecksum))?
         };
 
@@ -2200,7 +2334,7 @@ impl RvfStore {
         program_bytecode: &[u8],
         btf_data: Option<&[u8]>,
     ) -> Result<u64, RvfError> {
-        if self.read_only {
+        if self.is_write_blocked() {
             return Err(err(ErrorCode::ReadOnly));
         }
 
@@ -2225,10 +2359,7 @@ impl RvfStore {
             .as_mut()
             .ok_or_else(|| err(ErrorCode::InvalidManifest))?;
         let (seg_id, seg_offset) = {
-            let mut buf_writer = BufWriter::new(&self.file);
-            buf_writer
-                .seek(SeekFrom::End(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            let mut buf_writer = Self::append_cursor(&self.file, &self.security)?;
             let written = writer
                 .write_ebpf_seg(&mut buf_writer, &header_bytes, program_bytecode, btf_data)
                 .map_err(|_| err(ErrorCode::FsyncFailed))?;
@@ -2273,7 +2404,7 @@ impl RvfStore {
 
         let (_header, payload) = {
             let mut reader = BufReader::new(&self.file);
-            read_path::read_segment_payload(&mut reader, entry.1)
+            self.read_seg(&mut reader, entry.1)
                 .map_err(|_| err(ErrorCode::InvalidChecksum))?
         };
 
@@ -2300,7 +2431,7 @@ impl RvfStore {
         bundle_data: &[u8],
         entry_path: &str,
     ) -> Result<u64, RvfError> {
-        if self.read_only {
+        if self.is_write_blocked() {
             return Err(err(ErrorCode::ReadOnly));
         }
 
@@ -2331,10 +2462,7 @@ impl RvfStore {
             .as_mut()
             .ok_or_else(|| err(ErrorCode::InvalidManifest))?;
         let (seg_id, seg_offset) = {
-            let mut buf_writer = BufWriter::new(&self.file);
-            buf_writer
-                .seek(SeekFrom::End(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            let mut buf_writer = Self::append_cursor(&self.file, &self.security)?;
             let written = writer
                 .write_dashboard_seg(&mut buf_writer, &header_bytes, bundle_data)
                 .map_err(|_| err(ErrorCode::FsyncFailed))?;
@@ -2382,7 +2510,7 @@ impl RvfStore {
 
         let (_header, payload) = {
             let mut reader = BufReader::new(&self.file);
-            read_path::read_segment_payload(&mut reader, entry.1)
+            self.read_seg(&mut reader, entry.1)
                 .map_err(|_| err(ErrorCode::InvalidChecksum))?
         };
 
@@ -2416,7 +2544,7 @@ impl RvfStore {
         bootstrap_priority: u8,
         interpreter_type: u8,
     ) -> Result<u64, RvfError> {
-        if self.read_only {
+        if self.is_write_blocked() {
             return Err(err(ErrorCode::ReadOnly));
         }
 
@@ -2446,10 +2574,7 @@ impl RvfStore {
             .as_mut()
             .ok_or_else(|| err(ErrorCode::InvalidManifest))?;
         let (seg_id, seg_offset) = {
-            let mut buf_writer = BufWriter::new(&self.file);
-            buf_writer
-                .seek(SeekFrom::End(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            let mut buf_writer = Self::append_cursor(&self.file, &self.security)?;
             let written = writer
                 .write_wasm_seg(&mut buf_writer, &header_bytes, wasm_bytecode)
                 .map_err(|_| err(ErrorCode::FsyncFailed))?;
@@ -2493,7 +2618,7 @@ impl RvfStore {
 
         let (_header, payload) = {
             let mut reader = BufReader::new(&self.file);
-            read_path::read_segment_payload(&mut reader, entry.1)
+            self.read_seg(&mut reader, entry.1)
                 .map_err(|_| err(ErrorCode::InvalidChecksum))?
         };
 
@@ -2524,7 +2649,7 @@ impl RvfStore {
         for entry in entries {
             let (_header, payload) = {
                 let mut reader = BufReader::new(&self.file);
-                read_path::read_segment_payload(&mut reader, entry.1)
+                self.read_seg(&mut reader, entry.1)
                     .map_err(|_| err(ErrorCode::InvalidChecksum))?
             };
 
@@ -2556,7 +2681,8 @@ impl RvfStore {
             // Read the WasmHeader role byte (offset 0x06 within the payload)
             let result = (|| -> Result<bool, RvfError> {
                 let mut reader = BufReader::new(&self.file);
-                let (_header, payload) = read_path::read_segment_payload(&mut reader, offset)
+                let (_header, payload) = self
+                    .read_seg(&mut reader, offset)
                     .map_err(|_| err(ErrorCode::InvalidChecksum))?;
                 if payload.len() < 64 {
                     return Ok(false);
@@ -2631,7 +2757,8 @@ impl RvfStore {
 
     /// Persist a file-level metadata value in the authoritative META_SEG.
     pub fn set_file_metadata(&mut self, key: String, value: MetadataValue) -> Result<(), RvfError> {
-        if self.read_only || self.embedding_compatibility == EmbeddingCompatibility::VectorReadOnly
+        if self.is_write_blocked()
+            || self.embedding_compatibility == EmbeddingCompatibility::VectorReadOnly
         {
             return Err(err(ErrorCode::ReadOnly));
         }
@@ -2687,6 +2814,28 @@ impl RvfStore {
             dropped_generations: self.dropped_metadata_generations,
             dropped_records: self.dropped_metadata_records,
         }
+    }
+
+    /// What `open` ignored after the manifest it served. `is_torn()` means the
+    /// file ends inside a segment: a crashed append (recovered, by design) or a
+    /// truncated/partially downloaded file (indistinguishable from the bytes).
+    pub fn tail_recovery(&self) -> TailRecovery {
+        self.tail_recovery
+    }
+
+    /// Like [`Self::open_readonly`], but refuses a file that ends inside a
+    /// segment with `TruncatedSegment` instead of silently serving the older
+    /// manifest. Use this for files that arrived over a network or whose
+    /// provenance is unknown; use `open_readonly` for crash recovery.
+    ///
+    /// A file cut exactly on a segment boundary still opens (the cut is
+    /// undetectable without a length commitment in the file).
+    pub fn open_readonly_strict(path: &Path) -> Result<Self, RvfError> {
+        let store = Self::open_readonly(path)?;
+        if store.tail_recovery.is_torn() {
+            return Err(err(ErrorCode::TruncatedSegment));
+        }
+        Ok(store)
     }
 
     /// Cumulative observability counters for bounded linear metadata scans.
@@ -2809,7 +2958,8 @@ impl RvfStore {
         key: String,
         value: MetadataValue,
     ) -> Result<(), RvfError> {
-        if self.read_only || self.embedding_compatibility == EmbeddingCompatibility::VectorReadOnly
+        if self.is_write_blocked()
+            || self.embedding_compatibility == EmbeddingCompatibility::VectorReadOnly
         {
             return Err(err(ErrorCode::ReadOnly));
         }
@@ -2946,7 +3096,7 @@ impl RvfStore {
 
     /// Freeze (snapshot) this store. Prevents further writes to this generation.
     pub fn freeze(&mut self) -> Result<(), RvfError> {
-        if self.read_only {
+        if self.is_write_blocked() {
             return Err(err(ErrorCode::ReadOnly));
         }
 
@@ -3052,6 +3202,7 @@ impl RvfStore {
             committed_metadata: MetadataStore::new(),
             committed_file_metadata: BTreeMap::new(),
             dropped_metadata_generations: 0,
+            tail_recovery: TailRecovery::default(),
             dropped_metadata_records: 0,
             orphaned_metadata_offsets: Vec::new(),
             embedding_compatibility: self.embedding_compatibility,
@@ -3072,6 +3223,7 @@ impl RvfStore {
             rabitq: Mutex::new(None),
             rabitq_building: AtomicBool::new(false),
             parent_store: Mutex::new(None),
+            security: SecurityState::permissive(),
         };
 
         store.write_manifest()?;
@@ -3129,8 +3281,12 @@ impl RvfStore {
     /// `witness_type` is one of the `witness_types::*` constants.
     /// `action` is a human-readable action description encoded as bytes.
     ///
-    /// The witness entry is chain-linked to the previous witness via
-    /// `last_witness_hash` using `simple_shake256_256`.
+    /// The witness entry is a fixed 73-byte chain entry linked to the previous one via
+    /// `last_witness_hash` (SHAKE-256), verifiable by `rvf_crypto::verify_witness_chain`.
+    ///
+    /// The head follows the FILE, which is append-only: a failed later step of
+    /// the same operation (manifest write) does not remove the witness segment,
+    /// so callers must not roll `last_witness_hash` back.
     fn append_witness(&mut self, witness_type: u8, action: &[u8]) -> Result<(), RvfError> {
         let writer = self
             .seg_writer
@@ -3143,10 +3299,7 @@ impl RvfStore {
             .unwrap_or(0);
 
         let (seg_id, seg_offset) = {
-            let mut buf_writer = BufWriter::new(&self.file);
-            buf_writer
-                .seek(SeekFrom::End(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            let mut buf_writer = Self::append_cursor(&self.file, &self.security)?;
             let written = writer
                 .write_witness_seg(
                     &mut buf_writer,
@@ -3165,20 +3318,19 @@ impl RvfStore {
         };
 
         // Compute the payload length for the segment directory.
-        let payload_len = (1 + 8 + 4 + action.len() + 32) as u64;
+        let payload_len = rvf_crypto::WITNESS_ENTRY_SIZE as u64;
         self.segment_dir
             .push((seg_id, seg_offset, payload_len, SegmentType::Witness as u8));
 
-        // Build the serialized witness entry bytes and hash them to update
-        // the chain. This mirrors the payload layout exactly so that
-        // external verifiers can reconstruct the chain from raw segments.
-        let mut entry_bytes = Vec::with_capacity(1 + 8 + 4 + action.len() + 32);
-        entry_bytes.push(witness_type);
-        entry_bytes.extend_from_slice(&timestamp_ns.to_le_bytes());
-        entry_bytes.extend_from_slice(&(action.len() as u32).to_le_bytes());
-        entry_bytes.extend_from_slice(action);
-        entry_bytes.extend_from_slice(&self.last_witness_hash);
-        self.last_witness_hash = simple_shake256_256(&entry_bytes);
+        // Advance the chain head: SHAKE-256 of the exact 73-byte entry just
+        // written, which is what the next entry must carry as `prev_hash`.
+        let entry_bytes = rvf_crypto::encode_chain_entry(
+            &self.last_witness_hash,
+            action,
+            timestamp_ns,
+            witness_type,
+        );
+        self.last_witness_hash = rvf_crypto::chain_entry_hash(&entry_bytes);
 
         Ok(())
     }
@@ -3190,16 +3342,62 @@ impl RvfStore {
     }
 
     fn boot_with_ancestry(&mut self, ancestry: &mut HashSet<PathBuf>) -> Result<(), RvfError> {
-        let manifest = {
+        let located = {
             let mut reader = BufReader::new(&self.file);
-            read_path::find_latest_manifest(&mut reader)
+            // With a signature-checking policy and a page present, the page
+            // names the manifest: do not scan older than it.
+            let hint = read_path::ScanHint {
+                expect_offset: if self.security.policy.requires_signature() {
+                    security::signed_page_manifest_offset(&self.file)
+                } else {
+                    None
+                },
+            };
+            read_path::find_latest_manifest(&mut reader, hint, &mut read_path::ScanStats::default())
                 .map_err(|_| err(ErrorCode::ManifestNotFound))?
         };
 
-        let manifest = match manifest {
+        let located = match located {
             Some(m) => m,
-            None => return Err(err(ErrorCode::ManifestNotFound)),
+            None => {
+                // A file in a segment-format version this reader does not
+                // know is not "missing a manifest": say so (#1276 item 2).
+                let mut reader = BufReader::new(&self.file);
+                return Err(match read_path::unsupported_version_at_start(&mut reader) {
+                    Ok(Some(v)) => {
+                        log::warn!(
+                            "rvf: {} uses segment format version {v}; this reader supports \
+                             version {} (newer or unsupported format)",
+                            self.path.display(),
+                            rvf_types::SEGMENT_VERSION
+                        );
+                        err(ErrorCode::InvalidVersion)
+                    }
+                    _ => err(ErrorCode::ManifestNotFound),
+                });
+            }
         };
+        // Record what lies after the manifest we are about to serve (#1276):
+        // a torn append recovers to this snapshot (ADR-280), but so does a
+        // truncated file, so make the discarded tail visible.
+        let (tail_recovery, tail_witnesses) = {
+            let mut reader = BufReader::new(&self.file);
+            read_path::inspect_tail(&mut reader, &located).unwrap_or_default()
+        };
+        self.tail_recovery = tail_recovery;
+        if let Some(at) = self.tail_recovery.torn_at {
+            log::warn!(
+                "rvf: {} ends inside a segment (offset {at}); serving the last committed \
+                 manifest at offset {} and ignoring {} byte(s) after it",
+                self.path.display(),
+                located.offset,
+                self.tail_recovery.bytes_after_manifest
+            );
+        }
+        // Security policy (no-op under Permissive): signature, manifest
+        // binding, and committed per-segment hashes (ADR-354 item 5).
+        self.apply_open_policy(&located)?;
+        let manifest = located.manifest.clone();
 
         self.epoch = manifest.epoch;
         self.options.dimension = manifest.dimension;
@@ -3234,8 +3432,8 @@ impl RvfStore {
         for entry in vec_seg_entries {
             let (_header, payload) = {
                 let mut reader = BufReader::new(&self.file);
-                read_path::read_segment_payload(&mut reader, entry.offset)
-                    .map_err(|_| err(ErrorCode::InvalidChecksum))?
+                self.read_seg(&mut reader, entry.offset)
+                    .map_err(|e| Self::map_read_error(&e, ErrorCode::InvalidChecksum))?
             };
 
             // Fast path: bulk-copy the segment's rows straight into the
@@ -3272,13 +3470,41 @@ impl RvfStore {
         if let Some((_, offset, _, _)) = index_entry {
             let payload = {
                 let mut reader = BufReader::new(&self.file);
-                read_path::read_segment_payload(&mut reader, offset)
-                    .ok()
-                    .map(|(_, p)| p)
+                match self.read_seg(&mut reader, offset) {
+                    Ok((_, p)) => Some(p),
+                    // A signature-checking policy must not hide tampering by
+                    // quietly rebuilding the index: refuse the open.
+                    Err(e) if self.security.policy.requires_signature() => {
+                        return Err(Self::map_read_error(&e, ErrorCode::InvalidChecksum));
+                    }
+                    Err(_) => None,
+                }
             };
             if let Some(payload) = payload {
                 if let Some(idx) = VectorIndex::decode_payload(&payload, &self.vectors) {
                     *self.index.lock().unwrap_or_else(|e| e.into_inner()) = Some(idx);
+                }
+            }
+        }
+
+        self.restore_witness_head(&tail_witnesses);
+
+        // A writable open must not append after a torn tail: the torn header's
+        // declared length would swallow the new segments and the file would stay
+        // unreadable to every segment walker. Cut the torn bytes off first; this
+        // is exactly what recovery already ignores (ADR-280), so the served
+        // snapshot is unchanged. Files with a signed root page are left alone.
+        if !self.read_only
+            && !self.security.policy.requires_signature()
+            && !self.security.root_page_present.load(Ordering::Acquire)
+        {
+            if let Some(at) = self.tail_recovery.torn_at {
+                if self.file.set_len(at).is_ok() {
+                    log::warn!(
+                        "rvf: {} truncated a torn tail at offset {at} before appending",
+                        self.path.display()
+                    );
+                    self.tail_recovery.repaired = true;
                 }
             }
         }
@@ -3290,10 +3516,51 @@ impl RvfStore {
                 .map(|&(id, _, _, _)| id)
                 .max()
                 .unwrap_or(0);
-            self.seg_writer = Some(SegmentWriter::new(max_seg_id + 1));
+            let mut writer = SegmentWriter::new(max_seg_id + 1);
+            self.configure_writer(&mut writer, manifest.seg_hashes.as_deref());
+            self.seg_writer = Some(writer);
         }
+        self.verify_all_segments()?;
 
         Ok(())
+    }
+
+    /// Continue the witness hash chain across reopen: the head is the hash of
+    /// the newest WITNESS_SEG's last chain entry. If the newest witness is a
+    /// pre-0.5 legacy record, unreadable, or absent, the chain restarts from
+    /// genesis (zero) -- `rvf verify-witness` treats a legacy record as such a
+    /// restart point.
+    fn restore_witness_head(&mut self, tail_witnesses: &[u64]) {
+        self.last_witness_hash = [0u8; 32];
+        // Candidates newest first, in FILE order: witnesses after the last
+        // manifest (an unsigned audited query, or a commit whose manifest was
+        // lost) are not in the segment directory but are in the file, and the
+        // verifier walks the file.
+        let listed = self
+            .segment_dir
+            .iter()
+            .filter(|&&(_, _, _, t)| t == SegmentType::Witness as u8)
+            .map(|&(_, off, _, _)| off);
+        let candidates: Vec<u64> = listed.chain(tail_witnesses.iter().copied()).collect();
+        // Attestation witnesses carry their own independent chain and do not
+        // move the runtime head (same rule as `rvf verify-witness`); skip them.
+        for offset in candidates.into_iter().rev().take(64) {
+            let mut reader = BufReader::new(&self.file);
+            let Ok((_, payload)) = self.read_seg(&mut reader, offset) else {
+                return;
+            };
+            if rvf_crypto::is_valid_attestation_witness(&payload) {
+                continue;
+            }
+            if rvf_crypto::classify_witness_payload(&payload)
+                == rvf_crypto::WitnessPayloadKind::Chain
+                && payload.len() >= rvf_crypto::WITNESS_ENTRY_SIZE
+            {
+                let last = &payload[payload.len() - rvf_crypto::WITNESS_ENTRY_SIZE..];
+                self.last_witness_hash = rvf_crypto::chain_entry_hash(last);
+            }
+            return;
+        }
     }
 
     fn restore_cow_state(&mut self, ancestry: &mut HashSet<PathBuf>) -> Result<(), RvfError> {
@@ -3318,7 +3585,7 @@ impl RvfStore {
 
         let cow_payload = {
             let mut reader = BufReader::new(&self.file);
-            read_path::read_segment_payload(&mut reader, cow_entry.1)
+            self.read_seg(&mut reader, cow_entry.1)
                 .map_err(|_| err(ErrorCode::CowMapCorrupt))?
                 .1
         };
@@ -3426,7 +3693,7 @@ impl RvfStore {
 
         let membership_payload = {
             let mut reader = BufReader::new(&self.file);
-            read_path::read_segment_payload(&mut reader, membership_entry.1)
+            self.read_seg(&mut reader, membership_entry.1)
                 .map_err(|_| err(ErrorCode::MembershipInvalid))?
                 .1
         };
@@ -3555,10 +3822,7 @@ impl RvfStore {
             .seg_writer
             .as_mut()
             .ok_or_else(|| err(ErrorCode::InvalidManifest))?;
-        let mut buf_writer = BufWriter::new(&self.file);
-        buf_writer
-            .seek(SeekFrom::End(0))
-            .map_err(|_| err(ErrorCode::FsyncFailed))?;
+        let mut buf_writer = Self::append_cursor(&self.file, &self.security)?;
         let (cow_id, cow_offset) = writer
             .write_cow_map_seg(&mut buf_writer, &cow_payload)
             .map_err(|_| err(ErrorCode::FsyncFailed))?;
@@ -3602,11 +3866,20 @@ impl RvfStore {
             None
         };
 
+        // Signed stores commit to every directory segment's hash.
+        let signing = self.security.signing_key.is_some();
+        let hash_entries = if signing {
+            Some(
+                writer
+                    .hash_entries(&self.segment_dir)
+                    .ok_or_else(|| err(ErrorCode::InvalidManifest))?,
+            )
+        } else {
+            None
+        };
+
         let (manifest_seg_id, manifest_offset) = {
-            let mut buf_writer = BufWriter::new(&self.file);
-            buf_writer
-                .seek(SeekFrom::End(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            let mut buf_writer = Self::append_cursor(&self.file, &self.security)?;
             let written = writer
                 .write_manifest_seg_with_identity(
                     &mut buf_writer,
@@ -3618,6 +3891,7 @@ impl RvfStore {
                     &self.segment_dir,
                     &deleted_ids,
                     fi,
+                    hash_entries.as_deref(),
                 )
                 .map_err(|_| err(ErrorCode::FsyncFailed))?;
             // A dropped `BufWriter` swallows flush errors, so an acknowledged
@@ -3628,10 +3902,22 @@ impl RvfStore {
             written
         };
 
-        let mut manifest_payload_len =
-            (22 + self.segment_dir.len() * 25 + 4 + deleted_ids.len() * 8) as u64;
-        if fi.is_some() {
-            manifest_payload_len += 4 + 68; // FIDI marker + FileIdentity
+        let manifest_payload_len = write_path::manifest_payload_len(
+            self.segment_dir.len(),
+            deleted_ids.len(),
+            fi.is_some(),
+            hash_entries.as_ref().map(Vec::len),
+        );
+        if signing {
+            let hash = writer
+                .hash_of(manifest_seg_id)
+                .ok_or_else(|| err(ErrorCode::InvalidManifest))?;
+            self.security.last_manifest = Some(security::LastManifest {
+                seg_id: manifest_seg_id,
+                offset: manifest_offset,
+                len: SEGMENT_HEADER_SIZE as u64 + manifest_payload_len,
+                hash,
+            });
         }
         self.segment_dir.push((
             manifest_seg_id,
@@ -3643,7 +3929,8 @@ impl RvfStore {
         self.file
             .sync_all()
             .map_err(|_| err(ErrorCode::FsyncFailed))?;
-        Ok(())
+        self.refresh_committed();
+        self.seal_root_page()
     }
 
     /// True when `vector_id` belongs to this store's committed vector state and
@@ -3816,10 +4103,7 @@ impl RvfStore {
             .as_mut()
             .ok_or_else(|| err(ErrorCode::InvalidManifest))?;
         let (segment_id, offset) = {
-            let mut buffered = BufWriter::new(&self.file);
-            buffered
-                .seek(SeekFrom::End(0))
-                .map_err(|_| err(ErrorCode::FsyncFailed))?;
+            let mut buffered = Self::append_cursor(&self.file, &self.security)?;
             let result = writer
                 .write_meta_seg(&mut buffered, &payload)
                 .map_err(|_| err(ErrorCode::FsyncFailed))?;
@@ -3922,7 +4206,7 @@ impl RvfStore {
             }
             let payload = {
                 let mut reader = BufReader::new(&self.file);
-                read_path::read_segment_payload(&mut reader, offset)
+                self.read_seg(&mut reader, offset)
                     .ok()
                     .map(|(_, payload)| payload)
             };
@@ -4585,6 +4869,130 @@ mod tests {
         assert!(results.iter().all(|r| r.id != 2));
 
         store.close().unwrap();
+    }
+
+    #[test]
+    fn reingest_after_delete_makes_the_id_visible_again() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("reingest.rvf");
+
+        let options = RvfOptions {
+            dimension: 2,
+            metric: DistanceMetric::L2,
+            ..Default::default()
+        };
+        let mut store = RvfStore::create(&path, options).unwrap();
+
+        let original = vec![1.0f32, 0.0];
+        store.ingest_batch(&[&original[..]], &[42], None).unwrap();
+        assert_eq!(store.delete(&[42]).unwrap().deleted, 1);
+
+        // Re-inserting the same id must resurrect it: a deletion is a statement
+        // about the old payload, not a permanent ban on the identifier.
+        let replacement = vec![0.0f32, 1.0];
+        store
+            .ingest_batch(&[&replacement[..]], &[42], None)
+            .unwrap();
+
+        let hits = store
+            .query(&[0.0, 1.0], 1, &QueryOptions::default())
+            .unwrap();
+        assert!(
+            hits.iter().any(|r| r.id == 42),
+            "id 42 stayed soft-deleted after re-ingest, so the new payload is unreachable"
+        );
+
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn compact_keeps_a_vector_reingested_after_delete() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("reingest_compact.rvf");
+
+        let options = RvfOptions {
+            dimension: 2,
+            metric: DistanceMetric::L2,
+            ..Default::default()
+        };
+        let mut store = RvfStore::create(&path, options).unwrap();
+
+        let keep = vec![1.0f32, 0.0];
+        let original = vec![0.0f32, 1.0];
+        store
+            .ingest_batch(&[&keep[..], &original[..]], &[1, 42], None)
+            .unwrap();
+        store.delete(&[42]).unwrap();
+
+        let replacement = vec![0.5f32, 0.5];
+        store
+            .ingest_batch(&[&replacement[..]], &[42], None)
+            .unwrap();
+
+        // Compaction physically drops whatever the bitmap still calls dead, so a
+        // stale bit here destroys live data rather than merely hiding it.
+        store.compact().unwrap();
+
+        let hits = store
+            .query(&[0.5, 0.5], 10, &QueryOptions::default())
+            .unwrap();
+        assert!(
+            hits.iter().any(|r| r.id == 42),
+            "compaction dropped a vector that had been re-ingested after deletion"
+        );
+
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn reingest_after_delete_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("reingest_reopen.rvf");
+
+        let options = RvfOptions {
+            dimension: 2,
+            metric: DistanceMetric::L2,
+            ..Default::default()
+        };
+
+        {
+            let mut store = RvfStore::create(&path, options).unwrap();
+
+            let original = vec![1.0f32, 0.0];
+            store.ingest_batch(&[&original[..]], &[42], None).unwrap();
+            assert_eq!(store.delete(&[42]).unwrap().deleted, 1);
+
+            let replacement = vec![0.0f32, 1.0];
+            store
+                .ingest_batch(&[&replacement[..]], &[42], None)
+                .unwrap();
+
+            store.close().unwrap();
+        }
+
+        // Reopen from the same directory: the deletion bit that was cleared
+        // in memory must also be cleared in the persisted manifest, or boot
+        // reconstructs id 42 as deleted again and buries the replacement.
+        {
+            let store = RvfStore::open(&path).unwrap();
+
+            let hits = store
+                .query(&[0.0, 1.0], 1, &QueryOptions::default())
+                .unwrap();
+            assert_eq!(
+                hits.len(),
+                1,
+                "id 42 came back soft-deleted after reopen, so the persisted \
+                 tombstone clear did not survive"
+            );
+            assert_eq!(hits[0].id, 42);
+            assert!(
+                hits[0].distance < f32::EPSILON,
+                "id 42 resolved to a vector other than the post-reingest replacement"
+            );
+
+            store.close().unwrap();
+        }
     }
 
     #[test]

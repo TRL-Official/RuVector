@@ -1,6 +1,6 @@
 [package]
 name = "rvf-manifest"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "RuVector Format two-level manifest system for segment tracking and compaction"
 license = "MIT OR Apache-2.0"
@@ -16,7 +16,7 @@ default = ["std"]
 std = ["rvf-types/std"]
 
 [dependencies]
-rvf-types = { version = "0.2.0", path = "../rvf-types" }
+rvf-types = { version = "0.3.0", path = "../rvf-types" }
 crc32c = "0.6"
 
 [dev-dependencies]

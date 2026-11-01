@@ -39,6 +39,8 @@ fn map_rvf_err(e: RvfError) -> napi::Error {
         RvfError::QualityBelowThreshold { quality, reason } => {
             format!("Quality below threshold ({quality:?}): {reason}")
         }
+        // `RvfError` is `#[non_exhaustive]`.
+        other => format!("RVF error: {other}"),
     };
     napi::Error::from_reason(msg)
 }

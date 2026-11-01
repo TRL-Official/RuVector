@@ -11,6 +11,7 @@
  * Replaces the simple Q-learning approach with real ML-powered intelligence.
  */
 
+import * as path from 'path';
 import { FastAgentDB, Episode, Trajectory, EpisodeSearchResult } from './agentdb-fast';
 import { SonaEngine, SonaConfig, LearnedPattern, SonaStats, isSonaAvailable } from './sona-wrapper';
 import { OnnxEmbedder, OnnxEmbedderConfig, isOnnxAvailable, initOnnxEmbedder, getEmbedderProvenance, getEmbeddingSpaceIdentity, getEmbeddingSpaceId, embedBulk, shutdownParallelEmbedder } from './onnx-embedder';
@@ -312,11 +313,19 @@ export class IntelligenceEngine {
   }
 
   private async initVectorDb(): Promise<void> {
+    // Without an explicit storagePath the native VectorDb defaults to
+    // ./ruvector.db, which dropped a multi-MB file into the user's project on
+    // the first semantic hook. The index is rebuilt from the JSON store in every
+    // (short-lived) hook process anyway, so brute-force cosine over memories is
+    // both cheaper and file-free; an HNSW index is used only when a storage
+    // location is configured.
+    if (!this.config.storagePath) return;
     try {
       const VDB = getVectorDB();
       this.vectorDb = new VDB({
         dimensions: this.config.embeddingDim,
         distanceMetric: 'Cosine',
+        storagePath: path.join(this.config.storagePath, 'engine-vectors.db'),
       });
     } catch {
       // VectorDB not available, use fallback
@@ -562,8 +571,10 @@ export class IntelligenceEngine {
   /**
    * Store content in vector memory (uses ONNX if available)
    */
-  async remember(content: string, type: string = 'general'): Promise<MemoryEntry> {
-    const id = `mem-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  async remember(content: string, type: string = 'general', id?: string): Promise<MemoryEntry> {
+    // Callers that persist the memory elsewhere pass their own id so the engine
+    // and the store agree on it (forget/update address memories by id).
+    id = id || `mem-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
     // Use async ONNX embeddings if available for better semantic quality
     const embedding = await this.embedAsync(content);
 
@@ -592,6 +603,37 @@ export class IntelligenceEngine {
     }
 
     return entry;
+  }
+
+  /**
+   * Remove a memory by id. Returns false when the id is unknown.
+   */
+  forget(id: string): boolean {
+    const existed = this.memories.delete(id);
+    if (existed && this.vectorDb) {
+      this.vectorDb.delete(id).catch(() => {});
+    }
+    return existed;
+  }
+
+  /**
+   * Replace the in-memory memory set (used when the backing store changed on
+   * disk or was edited), keeping routing and other learned state intact.
+   */
+  replaceMemories(entries: MemoryEntry[]): void {
+    const previous = Array.from(this.memories.keys());
+    this.memories.clear();
+    for (const mem of entries) this.memories.set(mem.id, mem);
+    if (this.vectorDb) {
+      const db = this.vectorDb;
+      Promise.all(previous.map(id => db.delete(id).catch(() => false)))
+        .then(() => Promise.all(entries.filter(m => m.embedding?.length).map(m => db.insert({
+          id: m.id,
+          vector: new Float32Array(m.embedding),
+          metadata: JSON.stringify({ content: m.content, type: m.type, created: m.created }),
+        }).catch(() => {}))))
+        .catch(() => {});
+    }
   }
 
   /**

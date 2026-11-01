@@ -60,6 +60,10 @@ impl WasmStore {
             for d in 0..dim {
                 data.push(unsafe { *vecs_ptr.add(i * dim + d) });
             }
+            // Non-finite components make every distance NaN/inf: reject the row.
+            if data.iter().any(|x| !x.is_finite()) {
+                continue;
+            }
             self.entries.push(VecEntry {
                 id,
                 data,
@@ -89,6 +93,10 @@ impl WasmStore {
         };
 
         let query: Vec<f32> = (0..dim).map(|i| unsafe { *query_ptr.add(i) }).collect();
+        // Invalid input: NaN/inf query (same rule as rvf-runtime NonFiniteQuery).
+        if query.iter().any(|x| !x.is_finite()) {
+            return -2;
+        }
 
         // Collect (distance, id) for all live entries
         let mut candidates: Vec<(f32, u64)> = Vec::new();
@@ -98,6 +106,10 @@ impl WasmStore {
             }
             let dist = compute_distance(&query, &entry.data, metric);
             candidates.push((dist, entry.id));
+        }
+        // Distances that overflow to inf/NaN cannot be ranked: refuse.
+        if candidates.iter().any(|(d, _)| !d.is_finite()) {
+            return -2;
         }
 
         // Sort by distance ascending

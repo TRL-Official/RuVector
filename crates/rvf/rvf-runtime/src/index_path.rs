@@ -292,6 +292,26 @@ impl VectorIndex {
     /// trailer, is corrupt, or is stale (references an ID that no longer
     /// exists in `vectors`). Callers treat `None` as "rebuild from vectors".
     pub(crate) fn decode_payload(payload: &[u8], vectors: &VectorData) -> Option<Self> {
+        let (graph, ids) = decode_graph(payload)?;
+        // 3. Staleness check: every indexed ID must still exist in the
+        //    store (soft-deleted vectors remain present until compaction).
+        for &id in &ids {
+            vectors.get(id)?;
+        }
+        Some(Self {
+            graph,
+            members: ids.into_iter().collect(),
+            dirty: false,
+        })
+    }
+}
+
+/// Decode an INDEX_SEG payload (codec + `RVIX` trailer) into a graph over
+/// vector IDs, without validating it against any vector store. Returns the
+/// graph and the sorted ID list, or `None` for a missing, unknown-version or
+/// corrupt payload.
+pub(crate) fn decode_graph(payload: &[u8]) -> Option<(HnswGraph, Vec<u64>)> {
+    {
         // 1. Locate and parse the trailer from the end of the payload.
         if payload.len() < 8 || payload[payload.len() - 4..] != TRAILER_MAGIC {
             return None;
@@ -345,12 +365,6 @@ impl VectorIndex {
             return None;
         }
 
-        // 3. Staleness check: every indexed ID must still exist in the
-        //    store (soft-deleted vectors remain present until compaction).
-        for &id in &ids {
-            vectors.get(id)?;
-        }
-
         // 4. Rebuild the graph in vector-ID space.
         let m = (data.header.m as usize).max(2);
         let config = HnswConfig {
@@ -394,11 +408,7 @@ impl VectorIndex {
                 .copied();
         }
 
-        Some(Self {
-            graph,
-            members: ids.into_iter().collect(),
-            dirty: false,
-        })
+        Some((graph, ids))
     }
 }
 

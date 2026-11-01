@@ -6,6 +6,8 @@
 
 pub mod error;
 pub mod http;
+pub mod stream;
+pub mod stream_client;
 pub mod tcp;
 pub mod ws;
 
@@ -66,22 +68,38 @@ pub fn open_or_create_store(config: &ServerConfig) -> Result<SharedStore, rvf_ty
 
 /// Start both HTTP and TCP servers. Blocks until shutdown.
 pub async fn run(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    run_with_stream(config, None).await
+}
+
+/// [`run`] plus the verified-stream endpoints (HTTP and TCP `0x05`/`0x85`)
+/// when `stream` is configured.
+pub async fn run_with_stream(
+    config: ServerConfig,
+    stream: Option<stream::StreamServerConfig>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let store = open_or_create_store(&config).map_err(|e| format!("failed to open store: {e}"))?;
 
     let http_addr = format!("0.0.0.0:{}", config.http_port);
     let tcp_addr = format!("0.0.0.0:{}", config.tcp_port);
 
     let (event_tx, _rx) = ws::event_channel();
-    let app = http::router_with_static(store.clone(), event_tx, None);
+    let mut app = http::router_with_static(store.clone(), event_tx, None);
+    let stream_srv = match stream {
+        Some(cfg) => Some(stream::StreamServer::load(cfg)?),
+        None => None,
+    };
+    if let Some(s) = &stream_srv {
+        app = app.merge(stream::router(s.clone()));
+    }
     let listener = tokio::net::TcpListener::bind(&http_addr).await?;
     eprintln!("rvf-server HTTP listening on {http_addr}");
     eprintln!("rvf-server TCP  listening on {tcp_addr}");
 
     tokio::select! {
-        result = axum::serve(listener, app) => {
+        result = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()) => {
             result?;
         }
-        result = tcp::serve_tcp(&tcp_addr, store) => {
+        result = tcp::serve_tcp_with_stream(&tcp_addr, store, stream_srv) => {
             result?;
         }
     }

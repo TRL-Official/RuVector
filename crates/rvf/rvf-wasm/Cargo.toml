@@ -15,8 +15,8 @@ rust-version = "1.87"
 crate-type = ["cdylib"]
 
 [dependencies]
-rvf-types = { version = "0.2.0", path = "../rvf-types", default-features = false }
-rvf-crypto = { version = "0.2.0", path = "../rvf-crypto", default-features = false }
+rvf-types = { version = "0.3.0", path = "../rvf-types", default-features = false }
+rvf-crypto = { version = "0.3.0", path = "../rvf-crypto", default-features = false }
 dlmalloc = { version = "0.2", features = ["global"] }
 
 [profile.release]

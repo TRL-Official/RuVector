@@ -264,7 +264,7 @@ pub fn verify_attestation_witness_payload(
             records_data.len()
         };
 
-        if rec_start > records_data.len() || rec_end > records_data.len() {
+        if rec_start > rec_end || rec_end > records_data.len() {
             return Err(RvfError::Code(ErrorCode::TruncatedSegment));
         }
 
@@ -281,6 +281,14 @@ pub fn verify_attestation_witness_payload(
     }
 
     Ok(results)
+}
+
+/// True iff `data` is a complete, internally consistent attestation witness
+/// payload (non-empty; chain, record hashes and record headers all verify).
+/// Used to tell attestation WITNESS_SEGs from runtime chain entries without
+/// guessing from the length: a payload that merely looks similar is not one.
+pub fn is_valid_attestation_witness(data: &[u8]) -> bool {
+    matches!(verify_attestation_witness_payload(data), Ok(v) if !v.is_empty())
 }
 
 // ---------------------------------------------------------------------------

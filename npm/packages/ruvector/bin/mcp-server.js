@@ -24,6 +24,9 @@ const {
 } = require('@modelcontextprotocol/sdk/types.js');
 const path = require('path');
 const fs = require('fs');
+const { serializeStore, resolveIntelStorePath } = require('./intel-store');
+const memoryStore = require('./memory-store');
+const recordValidate = require('./record-validate');
 const { execFileSync } = require('child_process');
 
 // ADR-256: default-deny MCP tool-access policy (RUVECTOR_MCP_ALLOW/DENY/PROFILE)
@@ -65,20 +68,128 @@ function validateRvfPath(filePath) {
       // Parent doesn't exist either — keep the resolved path for the block check
     }
   }
-  // Confine to the current working directory
-  const cwd = process.cwd();
-  if (!resolved.startsWith(cwd + path.sep) && resolved !== cwd) {
-    // Also block sensitive system paths regardless
-    const blocked = ['/etc', '/proc', '/sys', '/dev', '/boot', '/root', '/var/run', '/var/log', '/tmp'];
-    for (const prefix of blocked) {
-      if (resolved.startsWith(prefix)) {
-        throw new Error(`Access denied: path resolves to '${resolved}' which is outside the working directory and in restricted area '${prefix}'`);
-      }
-    }
-    // Allow paths outside cwd only if they're not in blocked directories
-    // (for tools that reference project files by absolute path)
+  // Confine to the working directory plus any roots the operator opted into via
+  // RUVECTOR_MCP_ROOTS (path-delimited). Anything else is refused: a denylist
+  // cannot cover $HOME secrets such as ~/.ssh or ~/.npmrc.
+  if (!getAllowedRoots().some(root => isWithin(root, resolved))) {
+    throw new Error(`Access denied: path resolves to '${resolved}', which is outside the working directory. ` +
+      'Set RUVECTOR_MCP_ROOTS to allow additional directories.');
   }
   return resolved;
+}
+
+/** validateRvfPath for every entry of an MCP `files` array argument. */
+function validateFileList(files) {
+  if (!Array.isArray(files) || files.length === 0) {
+    throw new Error('files must be a non-empty array of paths');
+  }
+  return files.map(validateRvfPath);
+}
+
+function realOrResolved(p) {
+  try { return fs.realpathSync(path.resolve(p)); } catch { return path.resolve(p); }
+}
+
+function getAllowedRoots() {
+  const roots = [realOrResolved(process.cwd())];
+  for (const r of (process.env.RUVECTOR_MCP_ROOTS || '').split(path.delimiter)) {
+    if (r.trim()) roots.push(realOrResolved(r.trim()));
+  }
+  return roots;
+}
+
+function isWithin(root, target) {
+  const rel = path.relative(root, target);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+// Keys that must never be used as dynamic object keys (prototype pollution).
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+function assertSafeKey(key, what) {
+  if (typeof key !== 'string' || key.length === 0 || UNSAFE_KEYS.has(key)) {
+    throw new Error(`Invalid ${what}: ${JSON.stringify(key)}`);
+  }
+  return key;
+}
+
+// Positional CLI args must not be parsed as flags (option injection).
+function assertPositional(value, what) {
+  if (typeof value !== 'string' || value.startsWith('-')) {
+    throw new Error(`Invalid ${what}: ${JSON.stringify(value)}`);
+  }
+  return value;
+}
+
+const BUILD_AGENT_FOCUS = ['quality', 'speed', 'security', 'testing', 'fullstack'];
+
+/** Reject non-finite numbers and clamp to [min, max] (learning inputs from MCP clients). */
+function boundedNumber(value, min, max, name) {
+  const n = typeof value === 'number' ? value : parseFloat(value);
+  if (!Number.isFinite(n)) throw new Error(`${name} must be a finite number, got ${JSON.stringify(value)}`);
+  return Math.min(max, Math.max(min, n));
+}
+
+function jsonResult(obj, isError = false) {
+  const out = { content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] };
+  if (isError) out.isError = true;
+  return out;
+}
+
+// Native VectorDB stores, as written by `ruvector create/insert`: the
+// dimension lives in a <path>.meta.json sidecar next to the database.
+function readVectorSidecar(dbPath) {
+  try {
+    const meta = JSON.parse(fs.readFileSync(`${dbPath}.meta.json`, 'utf8'));
+    const dimension = Number.isInteger(meta.dimension) && meta.dimension > 0 && meta.dimension <= recordValidate.LIMITS.maxDimension
+      ? meta.dimension : null;
+    return { dimension, metric: typeof meta.metric === 'string' ? meta.metric : 'cosine' };
+  } catch {
+    return { dimension: null, metric: 'cosine' };
+  }
+}
+
+function openVectorStore(rawPath) {
+  const dbPath = validateRvfPath(rawPath);
+  if (!fs.existsSync(dbPath)) throw new Error(`Database not found: ${dbPath}`);
+  const { dimension, metric } = readVectorSidecar(dbPath);
+  if (!dimension) throw new Error(`No dimension recorded for ${dbPath} (missing ${path.basename(dbPath)}.meta.json); create it with vectordb_create`);
+  const { VectorDB } = require('../dist/index.js');
+  return { db: new VectorDB({ dimensions: dimension, storagePath: dbPath }), dbPath, dimension, metric };
+}
+
+// Mirrors Intelligence.routeState() in cli.js so MCP learning lands on the
+// keys `hooks route` reads ("<task>:<ext>|<agent>").
+function routeStateKey(task, file) {
+  const t = task || '';
+  const taskType = t.includes('fix') ? 'fix' :
+                   t.includes('test') ? 'test' :
+                   t.includes('refactor') ? 'refactor' :
+                   t.includes('document') ? 'docs' : 'edit';
+  let ext = '';
+  if (file) {
+    const idx = file.lastIndexOf('.');
+    ext = idx >= 0 ? file.slice(idx).toLowerCase() : '';
+  }
+  return `${taskType}:${ext || 'unknown'}`;
+}
+
+function recordRoutePattern(data, state, agent, quality) {
+  if (!agent || agent === 'unknown') return null;
+  if (!data.patterns) data.patterns = {};
+  const key = `${state}|${agent}`;
+  const p = data.patterns[key] || { state, action: agent, q_value: 0.5, visits: 0, last_update: 0 };
+  p.q_value = p.q_value + 0.1 * (quality - p.q_value);
+  p.visits = (p.visits || 0) + 1;
+  p.last_update = Math.floor(Date.now() / 1000);
+  data.patterns[key] = p;
+  return key;
+}
+
+function assertGitRef(ref) {
+  if (typeof ref !== 'string' || ref.startsWith('-') || !/^[0-9A-Za-z._\/~^@{}:-]{1,200}$/.test(ref)) {
+    throw new Error(`Invalid git revision: ${JSON.stringify(ref)}`);
+  }
+  return ref;
 }
 
 /**
@@ -221,6 +332,7 @@ class Intelligence {
   constructor() {
     this.intelPath = this.getIntelPath();
     this.data = this.load();
+    this.loadedMtimeMs = this.diskMtimeMs();
     this.engine = null;
 
     // Initialize full engine if available
@@ -246,9 +358,9 @@ class Intelligence {
     const converted = { memories: [], routingPatterns: {}, errorPatterns: {}, coEditPatterns: {} };
     if (data.memories) {
       converted.memories = data.memories.map(m => ({
-        id: m.id || `mem-${Date.now()}`,
+        id: m.id,
         content: m.content,
-        type: m.type || 'general',
+        type: m.memory_type || m.type || 'general',
         embedding: m.embedding || [],
         created: m.created || new Date().toISOString(),
         accessed: 0,
@@ -257,8 +369,8 @@ class Intelligence {
     if (data.patterns) {
       for (const [key, value] of Object.entries(data.patterns)) {
         const [state, action] = key.split('|');
-        if (state && action) {
-          if (!converted.routingPatterns[state]) converted.routingPatterns[state] = {};
+        if (state && action && !UNSAFE_KEYS.has(state) && !UNSAFE_KEYS.has(action)) {
+          if (!Object.prototype.hasOwnProperty.call(converted.routingPatterns, state)) converted.routingPatterns[state] = {};
           converted.routingPatterns[state][action] = value.q_value || value || 0.5;
         }
       }
@@ -267,12 +379,67 @@ class Intelligence {
   }
 
   getIntelPath() {
-    const projectPath = path.join(process.cwd(), '.ruvector', 'intelligence.json');
-    const homePath = path.join(require('os').homedir(), '.ruvector', 'intelligence.json');
-    if (fs.existsSync(path.dirname(projectPath))) return projectPath;
-    if (fs.existsSync(path.join(process.cwd(), '.claude'))) return projectPath;
-    if (fs.existsSync(homePath)) return homePath;
-    return projectPath;
+    return resolveIntelStorePath();
+  }
+
+  diskMtimeMs() {
+    try { return fs.statSync(this.intelPath).mtimeMs; } catch { return 0; }
+  }
+
+  // CLI hooks (separate processes) write the same store while this server is
+  // running. Reload before each tool call when the file changed on disk, so the
+  // server's next save() does not overwrite their learning with a stale copy.
+  syncEngineMemories() {
+    if (this.engine && typeof this.engine.replaceMemories === 'function') {
+      this.engine.replaceMemories(this.convertLegacyData(this.data).memories);
+    }
+  }
+
+  /**
+   * Update a memory in place. New content goes through the same embedder and
+   * provenance gate as remember() (ADR-210), so an edit cannot create a mixed
+   * store. Returns the updated view or null when the id is unknown.
+   */
+  async updateMemory(id, patch) {
+    const hit = memoryStore.findMemory(this.data, id);
+    if (!hit) return null;
+    const clean = memoryStore.validateMemoryPatch(patch);
+    let embedding;
+    if (clean.content !== undefined) {
+      let guard;
+      if (this.engine) {
+        embedding = await this.engine.embedAsync(clean.content);
+        guard = this.guardVectorWrite(this.activeWriteProvenance(embedding));
+      } else {
+        embedding = this.embed(clean.content);
+        guard = this.guardVectorWrite({ embedderKind: 'hash', modelId: null, dimension: embedding.length, normalize: true, prefixPolicy: 'none' });
+      }
+      if (!guard.ok) throw Object.assign(new Error(guard.error || 'store is read-only for vector writes (ADR-210)'), { code: 'ERR_EMBEDDING_PROVENANCE' });
+    }
+    const view = memoryStore.applyMemoryPatch(hit.memory, clean, embedding);
+    this.syncEngineMemories();
+    this.save();
+    return view;
+  }
+
+  forgetMemories(ids) {
+    const result = memoryStore.deleteMemories(this.data, ids);
+    if (result.deleted.length > 0) {
+      if (this.engine && typeof this.engine.forget === 'function') result.deleted.forEach(id => this.engine.forget(id));
+      this.save();
+    }
+    return result;
+  }
+
+  refreshIfChanged() {
+    const mtime = this.diskMtimeMs();
+    if (mtime !== this.loadedMtimeMs) {
+      this.data = this.load();
+      this.loadedMtimeMs = mtime;
+      // Another process changed the store: keep the engine's memory set (which
+      // serves recall) in step, so deleted/edited memories are not returned.
+      this.syncEngineMemories();
+    }
   }
 
   load() {
@@ -304,6 +471,8 @@ class Intelligence {
     // hand-edited store must not crash array/object consumers.
     if (!data || typeof data !== 'object' || Array.isArray(data)) return defaults();
     if (!Array.isArray(data.memories)) data.memories = [];
+    // Every memory gets a stable id so get/update/forget can address it.
+    memoryStore.ensureMemoryIds(data);
     return data;
   }
 
@@ -427,7 +596,8 @@ class Intelligence {
       } catch {}
     }
 
-    atomicWriteFileSync(this.intelPath, JSON.stringify(this.data, null, 2));
+    atomicWriteFileSync(this.intelPath, serializeStore(this.data));
+    this.loadedMtimeMs = this.diskMtimeMs();
   }
 
   stats() {
@@ -492,7 +662,7 @@ class Intelligence {
     if (this.engine) {
       let entry = null;
       try {
-        entry = await this.engine.remember(content, type);
+        entry = await this.engine.remember(content, type, memoryStore.newMemoryId());
       } catch {}
       if (entry) {
         // ADR-210 D0: validate provenance BEFORE persisting. Refusals
@@ -502,9 +672,9 @@ class Intelligence {
         if (!guard.ok) return { stored: false, skipped: true, reason: guard.error };
         // Also store in legacy format
         this.data.memories = Array.isArray(this.data.memories) ? this.data.memories : [];
-        this.data.memories.push({ content, type, created: new Date().toISOString(), embedding: entry.embedding });
+        this.data.memories.push({ id: entry.id, content, type, created: entry.created || new Date().toISOString(), embedding: entry.embedding });
         this.save();
-        return { stored: true, total: this.data.memories.length, engineStored: true };
+        return { stored: true, id: entry.id, total: this.data.memories.length, engineStored: true };
       }
     }
 
@@ -514,9 +684,10 @@ class Intelligence {
     const guard = this.guardVectorWrite({ embedderKind: 'hash', modelId: null, dimension: embedding.length, normalize: true, prefixPolicy: 'none' });
     if (!guard.ok) return { stored: false, skipped: true, reason: guard.error };
     this.data.memories = Array.isArray(this.data.memories) ? this.data.memories : [];
-    this.data.memories.push({ content, type, created: new Date().toISOString(), embedding });
+    const id = memoryStore.newMemoryId();
+    this.data.memories.push({ id, content, type, created: new Date().toISOString(), embedding });
     this.save();
-    return { stored: true, total: this.data.memories.length };
+    return { stored: true, id, total: this.data.memories.length };
   }
 
   async recall(query, topK = 5) {
@@ -530,6 +701,7 @@ class Intelligence {
           this.warnRecallProvenance(this.engine.getActiveProvenance());
         }
         return results.map(r => ({
+          id: r.id,
           content: r.content,
           type: r.type,
           score: r.score || 0,
@@ -756,13 +928,57 @@ const TOOLS = [
     }
   },
   {
+    name: 'hooks_memory_get',
+    description: 'Get one stored memory by id (ids come from hooks_remember, hooks_recall or hooks_memory_list)',
+    inputSchema: {
+      type: 'object',
+      properties: { id: { type: 'string', description: 'Memory id' } },
+      required: ['id']
+    }
+  },
+  {
+    name: 'hooks_memory_list',
+    description: 'List stored memories, newest first, with optional type filter and paging',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        type: { type: 'string', description: 'Only memories of this type' },
+        limit: { type: 'number', description: 'Page size (max 1000)', default: 50 },
+        offset: { type: 'number', description: 'Skip this many', default: 0 }
+      }
+    }
+  },
+  {
+    name: 'hooks_memory_update',
+    description: 'Update a memory by id: new content is re-embedded with the store\'s embedder; type and metadata can also change',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Memory id' },
+        content: { type: 'string', description: 'New content' },
+        type: { type: 'string', description: 'New memory type' },
+        metadata: { type: 'object', description: 'Replacement metadata object' }
+      },
+      required: ['id']
+    }
+  },
+  {
+    name: 'hooks_forget',
+    description: 'Delete stored memories by id',
+    inputSchema: {
+      type: 'object',
+      properties: { ids: { type: 'array', items: { type: 'string' }, description: 'Memory ids to delete' } },
+      required: ['ids']
+    }
+  },
+  {
     name: 'hooks_init',
     description: 'Initialize RuVector hooks in the current project',
     inputSchema: {
       type: 'object',
       properties: {
         pretrain: { type: 'boolean', description: 'Run pretrain after init', default: false },
-        build_agents: { type: 'string', description: 'Focus for agent generation (quality, speed, security, testing, fullstack)' },
+        build_agents: { type: 'string', enum: ['quality', 'speed', 'security', 'testing', 'fullstack'], description: 'Focus for agent generation' },
         force: { type: 'boolean', description: 'Force overwrite existing settings', default: false }
       },
       required: []
@@ -1373,7 +1589,7 @@ const TOOLS = [
       required: []
     }
   },
-  // Custom Worker System (agentic-flow@alpha.39+)
+  // Custom Worker System (agentic-flow@3.0.0-alpha.2.39+)
   {
     name: 'workers_presets',
     description: 'List available worker presets (quick-scan, deep-analysis, security-scan, learning, api-docs, test-analysis)',
@@ -1448,6 +1664,97 @@ const TOOLS = [
       required: []
     }
   },
+  // ── VectorDB (native HNSW store) CRUD Tools ────────────────────────────────
+  // Paths are confined to the working directory (+ RUVECTOR_MCP_ROOTS) and are
+  // always required: the library's ./ruvector.db default is never used here.
+  {
+    name: 'vectordb_create',
+    description: 'Create a vector database file (native HNSW store) with a fixed dimension',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Database file path (inside the project)' },
+        dimension: { type: 'number', description: 'Vector dimension' },
+        metric: { type: 'string', enum: ['cosine', 'euclidean', 'dot'], default: 'cosine' }
+      },
+      required: ['path', 'dimension']
+    }
+  },
+  {
+    name: 'vectordb_insert',
+    description: 'Insert or replace vectors (upsert by id; max 10000 per call)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Database file path' },
+        entries: { type: 'array', items: { type: 'object' }, description: 'Array of {id, vector, metadata?}' }
+      },
+      required: ['path', 'entries']
+    }
+  },
+  {
+    name: 'vectordb_get',
+    description: 'Get a vector and its metadata by id',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Database file path' },
+        id: { type: 'string', description: 'Vector id' },
+        include_vector: { type: 'boolean', default: true }
+      },
+      required: ['path', 'id']
+    }
+  },
+  {
+    name: 'vectordb_update',
+    description: 'Update the vector and/or metadata of an existing id (never creates)',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Database file path' },
+        id: { type: 'string', description: 'Vector id' },
+        vector: { type: 'array', items: { type: 'number' }, description: 'New vector' },
+        metadata: { type: 'object', description: 'New metadata' },
+        merge_metadata: { type: 'boolean', description: 'Merge into stored metadata instead of replacing', default: false }
+      },
+      required: ['path', 'id']
+    }
+  },
+  {
+    name: 'vectordb_delete',
+    description: 'Delete vectors by id',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Database file path' },
+        ids: { type: 'array', items: { type: 'string' }, description: 'Vector ids' }
+      },
+      required: ['path', 'ids']
+    }
+  },
+  {
+    name: 'vectordb_search',
+    description: 'k-nearest-neighbour search with optional metadata filter',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Database file path' },
+        vector: { type: 'array', items: { type: 'number' }, description: 'Query vector' },
+        k: { type: 'number', description: 'Number of results (max 1000)', default: 10 },
+        filter: { type: 'object', description: 'Metadata filter' }
+      },
+      required: ['path', 'vector']
+    }
+  },
+  {
+    name: 'vectordb_stats',
+    description: 'Vector count, dimension and metric of a database',
+    inputSchema: {
+      type: 'object',
+      properties: { path: { type: 'string', description: 'Database file path' } },
+      required: ['path']
+    }
+  },
   // ── RVF Vector Store Tools ────────────────────────────────────────────────
   {
     name: 'rvf_create',
@@ -1476,7 +1783,7 @@ const TOOLS = [
   },
   {
     name: 'rvf_ingest',
-    description: 'Insert vectors into an RVF store',
+    description: 'Insert vectors into an RVF store (an existing id is replaced; max 10000 per call)',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1506,7 +1813,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         path: { type: 'string', description: 'Path to .rvf store' },
-        ids: { type: 'array', description: 'Vector IDs to delete', items: { type: 'number' } }
+        ids: { type: 'array', description: 'Vector IDs to delete', items: { type: ['string', 'number'] } }
       },
       required: ['path', 'ids']
     }
@@ -1910,6 +2217,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 // Call tool handler
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
+  try { intel.refreshIfChanged(); } catch { /* keep serving from memory */ }
 
   // ADR-256 default-deny gate: refuse tools excluded by RUVECTOR_MCP_ALLOW/DENY/PROFILE
   if (!isToolAllowed(name, MCP_TOOL_POLICY)) {
@@ -2057,8 +2365,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               success: true,
               query: args.query,
               results: results.map(r => ({
+                id: r.id,
                 content: r.content,
-                type: r.type,
+                type: r.type || r.memory_type,
                 score: typeof r.score === 'number' ? r.score.toFixed(3) : r.score,
                 created: r.created,
                 engineResult: r.engineResult || false
@@ -2068,11 +2377,133 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'hooks_memory_get': {
+        try {
+          const memory = memoryStore.getMemory(intel.data, args.id);
+          return memory ? jsonResult({ success: true, memory }) : jsonResult({ success: false, error: `memory not found: ${args.id}` }, true);
+        } catch (e) { return jsonResult({ success: false, error: e.message }, true); }
+      }
+
+      case 'hooks_memory_list': {
+        try {
+          const type = args.type !== undefined ? memoryStore.validateMemoryType(args.type) : undefined;
+          return jsonResult({ success: true, ...memoryStore.listMemories(intel.data, { type, limit: args.limit, offset: args.offset }) });
+        } catch (e) { return jsonResult({ success: false, error: e.message }, true); }
+      }
+
+      case 'hooks_memory_update': {
+        try {
+          const patch = {};
+          for (const k of ['content', 'type', 'metadata']) if (args[k] !== undefined) patch[k] = args[k];
+          const memory = await intel.updateMemory(args.id, patch);
+          return memory ? jsonResult({ success: true, memory }) : jsonResult({ success: false, error: `memory not found: ${args.id}` }, true);
+        } catch (e) { return jsonResult({ success: false, error: e.message, code: e.code }, true); }
+      }
+
+      case 'hooks_forget': {
+        try {
+          const result = intel.forgetMemories(recordValidate.validateIdList(args.ids, 'ids'));
+          return jsonResult({ success: result.deleted.length > 0, ...result }, result.deleted.length === 0);
+        } catch (e) { return jsonResult({ success: false, error: e.message }, true); }
+      }
+
+      // ── VectorDB CRUD ──────────────────────────────────────────────────────
+      case 'vectordb_create': {
+        try {
+          const dbPath = validateRvfPath(args.path);
+          if (fs.existsSync(dbPath)) throw new Error(`Already exists: ${dbPath}`);
+          const dimension = args.dimension;
+          if (!Number.isInteger(dimension) || dimension < 1 || dimension > recordValidate.LIMITS.maxDimension) {
+            throw new Error(`dimension must be an integer between 1 and ${recordValidate.LIMITS.maxDimension}`);
+          }
+          const metric = args.metric || 'cosine';
+          if (!['cosine', 'euclidean', 'dot'].includes(metric)) throw new Error('metric must be cosine, euclidean or dot');
+          const { VectorDB } = require('../dist/index.js');
+          // The native store is created on first open.
+          new VectorDB({ dimensions: dimension, metric, storagePath: dbPath });
+          fs.writeFileSync(`${dbPath}.meta.json`, JSON.stringify({ dimension, metric, version: 1 }));
+          return jsonResult({ success: true, path: dbPath, dimension, metric });
+        } catch (e) { return jsonResult({ success: false, error: e.message }, true); }
+      }
+
+      case 'vectordb_insert': {
+        try {
+          const { db, dimension } = openVectorStore(args.path);
+          const entries = recordValidate.validateEntries(args.entries, dimension);
+          await db.insertBatch(entries);
+          return jsonResult({ success: true, upserted: entries.length, total: await db.len() });
+        } catch (e) { return jsonResult({ success: false, error: e.message }, true); }
+      }
+
+      case 'vectordb_get': {
+        try {
+          const id = recordValidate.validateRecordId(args.id);
+          const { db } = openVectorStore(args.path);
+          const record = await db.get(id);
+          if (!record) return jsonResult({ success: false, error: `not found: ${id}` }, true);
+          const out = { id, metadata: record.metadata };
+          if (args.include_vector !== false) out.vector = Array.from(record.vector || []);
+          return jsonResult({ success: true, record: out });
+        } catch (e) { return jsonResult({ success: false, error: e.message }, true); }
+      }
+
+      case 'vectordb_update': {
+        try {
+          const id = recordValidate.validateRecordId(args.id);
+          if (args.vector === undefined && args.metadata === undefined) throw new Error('nothing to update: pass vector and/or metadata');
+          const { db, dimension } = openVectorStore(args.path);
+          const patch = { mergeMetadata: args.merge_metadata === true };
+          if (args.vector !== undefined) patch.vector = recordValidate.validateVector(args.vector, dimension);
+          if (args.metadata !== undefined) patch.metadata = recordValidate.validateMetadata(args.metadata);
+          const updated = await db.update(id, patch);
+          return updated ? jsonResult({ success: true, id }) : jsonResult({ success: false, error: `not found: ${id}` }, true);
+        } catch (e) { return jsonResult({ success: false, error: e.message }, true); }
+      }
+
+      case 'vectordb_delete': {
+        try {
+          const ids = recordValidate.validateIdList(args.ids);
+          const { db } = openVectorStore(args.path);
+          const result = await db.deleteMany(ids);
+          return jsonResult({ success: result.deleted.length > 0, ...result, total: await db.len() }, result.deleted.length === 0);
+        } catch (e) { return jsonResult({ success: false, error: e.message }, true); }
+      }
+
+      case 'vectordb_search': {
+        try {
+          const { db, dimension } = openVectorStore(args.path);
+          const vector = recordValidate.validateVector(args.vector, dimension);
+          const query = { vector, k: recordValidate.validateK(args.k) };
+          if (args.filter !== undefined) query.filter = recordValidate.validateMetadata(args.filter, 'filter');
+          const results = await db.search(query);
+          return jsonResult({ success: true, results: results.map(r => ({ id: r.id, score: r.score, metadata: r.metadata })) });
+        } catch (e) { return jsonResult({ success: false, error: e.message }, true); }
+      }
+
+      case 'vectordb_stats': {
+        try {
+          const { db, dbPath, dimension, metric } = openVectorStore(args.path);
+          return jsonResult({ success: true, path: dbPath, count: await db.len(), dimension, metric, bytes: fs.statSync(dbPath).size });
+        } catch (e) { return jsonResult({ success: false, error: e.message }, true); }
+      }
+
       case 'hooks_init': {
+        // hooks init writes .claude/settings.json (permissions, hooks, MCP servers)
+        // and may overwrite CLAUDE.md. An MCP client (possibly prompt-injected) must
+        // not be able to widen its own future permissions without operator opt-in.
+        if (process.env.RUVECTOR_MCP_ALLOW_INIT !== '1') {
+          throw new Error('hooks_init is disabled over MCP because it rewrites .claude/settings.json. ' +
+            'Run `npx ruvector hooks init` from a terminal, or set RUVECTOR_MCP_ALLOW_INIT=1 for this server.');
+        }
         const commandArgs = ['hooks', 'init'];
         if (args.force) commandArgs.push('--force');
         if (args.pretrain) commandArgs.push('--pretrain');
-        if (args.build_agents) commandArgs.push('--build-agents', args.build_agents);
+        if (args.build_agents) {
+          if (!BUILD_AGENT_FOCUS.includes(args.build_agents)) {
+            throw new Error(`build_agents must be one of: ${BUILD_AGENT_FOCUS.join(', ')}`);
+          }
+          commandArgs.push('--build-agents', args.build_agents);
+        }
 
         try {
           const output = runRuvectorCli(commandArgs, { timeout: 60000 });
@@ -2166,7 +2597,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_doctor': {
         const commandArgs = ['hooks', 'doctor'];
-        if (args.fix) commandArgs.push('--fix');
+        if (args.fix) {
+          // --fix rewrites .claude/settings.json; same opt-in as hooks_init.
+          if (process.env.RUVECTOR_MCP_ALLOW_INIT !== '1') {
+            throw new Error('hooks_doctor fix is disabled over MCP. Run `npx ruvector hooks doctor --fix` ' +
+              'from a terminal, or set RUVECTOR_MCP_ALLOW_INIT=1 for this server.');
+          }
+          commandArgs.push('--fix');
+        }
 
         try {
           const output = runRuvectorCli(commandArgs, { timeout: 15000 });
@@ -2252,7 +2690,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           function checkForProtoPollution(obj, path) {
             if (typeof obj !== 'object' || obj === null) return;
             for (const key of Object.keys(obj)) {
-              if (dangerousKeys.includes(key)) {
+              // Pattern keys are "state|action" and get split on load, so check each part.
+              if (key.split('|').some(part => dangerousKeys.includes(part))) {
                 throw new Error(`Dangerous key '${key}' detected at ${path}.${key}`);
               }
             }
@@ -2429,7 +2868,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'hooks_trajectory_step': {
         const action = args.action;
         const result = args.result || '';
-        const reward = args.reward || 0.5;
+        const reward = args.reward === undefined ? 0.5 : boundedNumber(args.reward, -1, 1, 'reward');
 
         // Add to most recent trajectory
         const trajectories = intel.data.activeTrajectories || {};
@@ -2456,7 +2895,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_trajectory_end': {
         const success = args.success !== false;
-        const quality = args.quality || (success ? 0.8 : 0.2);
+        const quality = args.quality === undefined ? (success ? 0.8 : 0.2) : boundedNumber(args.quality, 0, 1, 'quality');
 
         const trajectories = intel.data.activeTrajectories || {};
         const trajIds = Object.keys(trajectories);
@@ -2480,6 +2919,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         intel.data.trajectories.push(traj);
         delete trajectories[latestTrajId];
 
+        // Close the routing loop: record the outcome where `hooks route` reads it.
+        const learnedRoute = recordRoutePattern(intel.data, routeStateKey(traj.context, traj.file), traj.agent, quality);
+
         // Learn from trajectory
         if (intel.engine && traj.steps.length > 0) {
           try {
@@ -2497,7 +2939,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               trajectory_id: latestTrajId,
               steps: traj.steps.length,
               duration_ms: traj.endTime - traj.startTime,
-              quality
+              quality,
+              learned_route: learnedRoute
             }, null, 2)
           }]
         };
@@ -2507,8 +2950,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const primaryFile = args.primary_file;
         const relatedFiles = args.related_files || [];
 
+        assertSafeKey(primaryFile, 'primary_file');
+        if (!Array.isArray(relatedFiles)) throw new Error('related_files must be an array');
+        relatedFiles.forEach(r => assertSafeKey(r, 'related file'));
         if (!intel.data.coEditPatterns) intel.data.coEditPatterns = {};
-        if (!intel.data.coEditPatterns[primaryFile]) intel.data.coEditPatterns[primaryFile] = {};
+        if (!Object.prototype.hasOwnProperty.call(intel.data.coEditPatterns, primaryFile)) intel.data.coEditPatterns[primaryFile] = {};
 
         for (const related of relatedFiles) {
           intel.data.coEditPatterns[primaryFile][related] = (intel.data.coEditPatterns[primaryFile][related] || 0) + 1;
@@ -2567,8 +3013,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const fix = args.fix;
         const file = args.file || '';
 
+        assertSafeKey(error, 'error');
         if (!intel.data.errors) intel.data.errors = {};
-        if (!intel.data.errors[error]) intel.data.errors[error] = [];
+        if (!Object.prototype.hasOwnProperty.call(intel.data.errors, error)) intel.data.errors[error] = [];
         intel.data.errors[error].push({ fix, file, recorded: Date.now() });
 
         // Use engine if available
@@ -2651,7 +3098,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_ast_analyze': {
         try {
-          const output = runRuvectorCli(['hooks', 'ast-analyze', args.file, '--json'], { timeout: 30000 });
+          const output = runRuvectorCli(['hooks', 'ast-analyze', validateRvfPath(args.file), '--json'], { timeout: 30000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2662,7 +3109,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const threshold = parseInt(args.threshold, 10) || 10;
           const output = runRuvectorCli(
-            ['hooks', 'ast-complexity', ...args.files, '--threshold', threshold],
+            ['hooks', 'ast-complexity', ...validateFileList(args.files), '--threshold', threshold],
             { timeout: 60000 },
           );
           return { content: [{ type: 'text', text: output }] };
@@ -2674,7 +3121,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'hooks_diff_analyze': {
         try {
           const commandArgs = ['hooks', 'diff-analyze'];
-          if (args.commit) commandArgs.push(args.commit);
+          if (args.commit) commandArgs.push(assertGitRef(args.commit));
           commandArgs.push('--json');
           const output = runRuvectorCli(commandArgs, { timeout: 60000 });
           return { content: [{ type: 'text', text: output }] };
@@ -2686,7 +3133,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'hooks_diff_classify': {
         try {
           const commandArgs = ['hooks', 'diff-classify'];
-          if (args.commit) commandArgs.push(args.commit);
+          if (args.commit) commandArgs.push(assertGitRef(args.commit));
           const output = runRuvectorCli(commandArgs, { timeout: 30000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
@@ -2710,7 +3157,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_coverage_route': {
         try {
-          const output = runRuvectorCli(['hooks', 'coverage-route', args.file], { timeout: 15000 });
+          const output = runRuvectorCli(['hooks', 'coverage-route', validateRvfPath(args.file)], { timeout: 15000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2719,7 +3166,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_coverage_suggest': {
         try {
-          const output = runRuvectorCli(['hooks', 'coverage-suggest', ...args.files], { timeout: 30000 });
+          const output = runRuvectorCli(['hooks', 'coverage-suggest', ...validateFileList(args.files)], { timeout: 30000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2728,7 +3175,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_graph_mincut': {
         try {
-          const output = runRuvectorCli(['hooks', 'graph-mincut', ...args.files], { timeout: 60000 });
+          const output = runRuvectorCli(['hooks', 'graph-mincut', ...validateFileList(args.files)], { timeout: 60000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2740,7 +3187,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const method = args.method || 'louvain';
           const clusters = parseInt(args.clusters, 10) || 3;
           const output = runRuvectorCli(
-            ['hooks', 'graph-cluster', ...args.files, '--method', method, '--clusters', clusters],
+            ['hooks', 'graph-cluster', ...validateFileList(args.files), '--method', method, '--clusters', clusters],
             { timeout: 60000 },
           );
           return { content: [{ type: 'text', text: output }] };
@@ -2751,7 +3198,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'hooks_security_scan': {
         try {
-          const output = runRuvectorCli(['hooks', 'security-scan', ...args.files], { timeout: 120000 });
+          const output = runRuvectorCli(['hooks', 'security-scan', ...validateFileList(args.files)], { timeout: 120000 });
           return { content: [{ type: 'text', text: output }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }] };
@@ -2810,7 +3257,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               const ASTParserCls = ASTParserMod.ASTParser || ASTParserMod.default;
               if (ASTParserCls) {
                 const parser = new ASTParserCls();
-                const code = require('fs').readFileSync(args.file, 'utf-8');
+                const code = require('fs').readFileSync(validateRvfPath(args.file), 'utf-8');
                 const ext = require('path').extname(args.file).slice(1);
                 const parsed = parser.parse(code, ext);
                 complexity = parser.calculateComplexity(parsed);
@@ -2917,7 +3364,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const engine = new LearningEngine();
-        if (intel.learning) engine.import(intel.learning);
+        if (intel.data.learning) engine.import(intel.data.learning);
 
         if (args.task && args.algorithm) {
           const config = {};
@@ -2926,7 +3373,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           if (args.discountFactor !== undefined) config.discountFactor = args.discountFactor;
           if (args.epsilon !== undefined) config.epsilon = args.epsilon;
           engine.configure(args.task, config);
-          intel.learning = engine.export();
+          intel.data.learning = engine.export();
           intel.save();
         }
 
@@ -2947,7 +3394,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const engine = new LearningEngine();
-        if (intel.learning) engine.import(intel.learning);
+        if (intel.data.learning) engine.import(intel.data.learning);
 
         const summary = engine.getStatsSummary();
         return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...summary }, null, 2) }] };
@@ -2962,19 +3409,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const engine = new LearningEngine();
-        if (intel.learning) engine.import(intel.learning);
+        if (intel.data.learning) engine.import(intel.data.learning);
 
         const experience = {
           state: args.state,
           action: args.action,
-          reward: args.reward,
+          reward: boundedNumber(args.reward, -1, 1, 'reward'),
           nextState: args.nextState || args.state,
           done: args.done || false,
           timestamp: Date.now()
         };
 
         const delta = engine.update(args.task, experience);
-        intel.learning = engine.export();
+        intel.data.learning = engine.export();
         intel.save();
 
         return { content: [{ type: 'text', text: JSON.stringify({
@@ -2995,7 +3442,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const engine = new LearningEngine();
-        if (intel.learning) engine.import(intel.learning);
+        if (intel.data.learning) engine.import(intel.data.learning);
 
         const task = args.task || 'agent-routing';
         let result = { success: true };
@@ -3004,13 +3451,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const experience = {
             state: args.state,
             action: args.action,
-            reward: args.reward,
+            reward: boundedNumber(args.reward, -1, 1, 'reward'),
             nextState: args.state,
             done: true,
             timestamp: Date.now()
           };
           const delta = engine.update(task, experience);
           result.recorded = { experience, delta, algorithm: engine.getConfig(task).algorithm };
+          if (task === 'agent-routing') {
+            recordRoutePattern(intel.data, args.state, args.action, (experience.reward + 1) / 2);
+          }
         }
 
         if (args.actions && args.actions.length > 0) {
@@ -3018,7 +3468,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           result.recommendation = best;
         }
 
-        intel.learning = engine.export();
+        intel.data.learning = engine.export();
         intel.save();
 
         return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
@@ -3154,7 +3604,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const experience = {
             state: exp.state,
             action: exp.action,
-            reward: exp.reward ?? 0.5,
+            reward: boundedNumber(exp.reward ?? 0.5, -1, 1, 'reward'),
             nextState: exp.nextState ?? exp.state,
             done: exp.done ?? false,
             timestamp: Date.now()
@@ -3275,7 +3725,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'workers_dispatch': {
         const prompt = String(args.prompt);
         try {
-          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'dispatch', prompt], {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', ['workers', 'dispatch', prompt], {
             timeout: 30000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3297,7 +3747,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const commandArgs = ['workers', 'status'];
           if (args.workerId) commandArgs.push(String(args.workerId));
-          const result = runNpxPackage('agentic-flow@alpha', commandArgs, {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', commandArgs, {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3318,7 +3768,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const commandArgs = ['workers', 'results'];
           if (args.json) commandArgs.push('--json');
-          const result = runNpxPackage('agentic-flow@alpha', commandArgs, {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', commandArgs, {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3347,7 +3797,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'workers_triggers': {
         try {
-          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'triggers'], {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', ['workers', 'triggers'], {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3366,7 +3816,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'workers_stats': {
         try {
-          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'stats'], {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', ['workers', 'stats'], {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3383,10 +3833,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
       }
 
-      // Custom Worker System handlers (agentic-flow@alpha.39+)
+      // Custom Worker System handlers (agentic-flow@3.0.0-alpha.2.39+)
       case 'workers_presets': {
         try {
-          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'presets'], {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', ['workers', 'presets'], {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3398,14 +3848,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: 'text', text: JSON.stringify({
             success: true,
             presets: ['quick-scan', 'deep-analysis', 'security-scan', 'learning', 'api-docs', 'test-analysis'],
-            note: 'Hardcoded fallback - install agentic-flow@alpha for full support'
+            note: 'Hardcoded fallback - install agentic-flow@3.0.0-alpha.2 for full support'
           }, null, 2) }] };
         }
       }
 
       case 'workers_phases': {
         try {
-          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'phases'], {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', ['workers', 'phases'], {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3417,7 +3867,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           return { content: [{ type: 'text', text: JSON.stringify({
             success: true,
             phases: ['file-discovery', 'static-analysis', 'security-analysis', 'pattern-extraction', 'dependency-analysis', 'complexity-analysis', 'test-coverage', 'api-extraction', 'secret-detection', 'report-generation'],
-            note: 'Partial list - install agentic-flow@alpha for all 24 phases'
+            note: 'Partial list - install agentic-flow@3.0.0-alpha.2 for all 24 phases'
           }, null, 2) }] };
         }
       }
@@ -3432,7 +3882,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           // containing quotes or shell metacharacters cannot escape to a shell.
           const commandArgs = ['workers', 'create', name, '--preset', preset];
           if (triggers) commandArgs.push('--triggers', triggers);
-          const result = runNpxPackage('agentic-flow@alpha', commandArgs, {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', commandArgs, {
             timeout: 30000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3454,7 +3904,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const name = String(args.name);
         const targetPath = String(args.path || '.');
         try {
-          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'run', name, '--path', targetPath], {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', ['workers', 'run', name, '--path', targetPath], {
             timeout: 120000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3475,7 +3925,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'workers_custom': {
         try {
-          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'custom'], {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', ['workers', 'custom'], {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3496,7 +3946,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const commandArgs = ['workers', 'init-config'];
           if (args.force) commandArgs.push('--force');
-          const result = runNpxPackage('agentic-flow@alpha', commandArgs, {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', commandArgs, {
             timeout: 15000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3517,7 +3967,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case 'workers_load_config': {
         const configFile = String(args.file || 'workers.yaml');
         try {
-          const result = runNpxPackage('agentic-flow@alpha', ['workers', 'load-config', '--file', configFile], {
+          const result = runNpxPackage('agentic-flow@3.0.0-alpha.2', ['workers', 'load-config', '--file', configFile], {
             timeout: 30000,
             stdio: ['pipe', 'pipe', 'pipe']
           });
@@ -3564,7 +4014,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const safePath = validateRvfPath(args.path);
           const { openRvfStore, rvfStatus } = require('../dist/core/rvf-wrapper.js');
           const store = await openRvfStore(safePath);
-          const status = await rvfStatus(store);
+          let status;
+          try { status = await rvfStatus(store); } finally { await require('../dist/core/rvf-wrapper.js').rvfClose(store); }
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, path: safePath, ...status }, null, 2) }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
@@ -3575,9 +4026,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const safePath = validateRvfPath(args.path);
           const { openRvfStore, rvfIngest, rvfClose } = require('../dist/core/rvf-wrapper.js');
+          const entries = recordValidate.validateEntries(args.entries);
           const store = await openRvfStore(safePath);
-          const result = await rvfIngest(store, args.entries);
-          await rvfClose(store);
+          let result;
+          try { result = await rvfIngest(store, entries.map(e => ({ ...e, vector: Array.from(e.vector) }))); } finally { await rvfClose(store); }
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...result }, null, 2) }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
@@ -3588,9 +4040,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const safePath = validateRvfPath(args.path);
           const { openRvfStore, rvfQuery, rvfClose } = require('../dist/core/rvf-wrapper.js');
+          const vector = Array.from(recordValidate.validateVector(args.vector));
+          const k = recordValidate.validateK(args.k);
           const store = await openRvfStore(safePath);
-          const results = await rvfQuery(store, args.vector, args.k || 10);
-          await rvfClose(store);
+          let results;
+          try { results = await rvfQuery(store, vector, k); } finally { await rvfClose(store); }
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, results }, null, 2) }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
@@ -3601,9 +4055,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         try {
           const safePath = validateRvfPath(args.path);
           const { openRvfStore, rvfDelete, rvfClose } = require('../dist/core/rvf-wrapper.js');
+          const ids = recordValidate.validateIdList(args.ids);
           const store = await openRvfStore(safePath);
-          const result = await rvfDelete(store, args.ids);
-          await rvfClose(store);
+          let result;
+          try { result = await rvfDelete(store, ids); } finally { await rvfClose(store); }
           return { content: [{ type: 'text', text: JSON.stringify({ success: true, ...result }, null, 2) }] };
         } catch (e) {
           return { content: [{ type: 'text', text: JSON.stringify({ success: false, error: e.message }, null, 2) }], isError: true };
@@ -4161,8 +4616,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         const query = args.query;
-        let regex;
-        try { regex = new RegExp(query, 'gi'); } catch { regex = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'); }
+        if (typeof query !== 'string' || query.length === 0 || query.length > 500) {
+          throw new Error('query must be a non-empty string of at most 500 characters');
+        }
+        // Literal match only: a caller-supplied RegExp can block the event loop (ReDoS).
+        const regex = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
 
         const matches = [];
         for (const mod of result.modules) {

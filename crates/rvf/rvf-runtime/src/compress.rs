@@ -13,6 +13,7 @@
 
 /// Compression errors.
 #[derive(Debug, PartialEq)]
+#[non_exhaustive]
 pub enum CompressError {
     /// Compressed data too short to contain header.
     TooShort,
