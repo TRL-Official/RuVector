@@ -37,6 +37,9 @@ function roundEmbedding(embedding) {
 }
 
 function serializeStore(data) {
+  // [neon-direct] the store is Neon (vectors kept exactly, no file to shrink): no rounding, so a save never turns an
+  // unchanged memory into a new version (rvdirect.rec_history) just because its floats were rounded
+  if (process.env.RUVECTOR_STORE === 'neon') return JSON.stringify(data);
   const out = Array.isArray(data && data.memories)
     ? { ...data, memories: data.memories.map(m => (m && Array.isArray(m.embedding) ? { ...m, embedding: roundEmbedding(m.embedding) } : m)) }
     : data;
