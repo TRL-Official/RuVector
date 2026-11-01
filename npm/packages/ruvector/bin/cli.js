@@ -5426,12 +5426,14 @@ hooksCmd.command('recall').description('Search memory').argument('<query...>', '
 
 // Memory CRUD: remember (create) / recall + memory-get + memory-list (read) /
 // memory-update / forget (delete). Ids come from `remember`, `recall` or `memory-list`.
+const RVN_CRUD_REFUSED = 'not available in neon-direct mode: memories live in Neon (never loaded whole), so this command would see none of them; read them with digital-twin\'s mem-bridge.mjs recall; an edit or delete needs the operator'; // [neon-direct]
 function printJsonResult(obj, ok = true) {
   console.log(JSON.stringify(obj, null, 2));
   if (!ok) process.exitCode = 1;
 }
 
 hooksCmd.command('memory-get').description('Show one memory by id').argument('<id>', 'Memory id').action((id) => {
+    if (RVN_ON) return printJsonResult({ success: false, error: 'memory-get: ' + RVN_CRUD_REFUSED }, false); // [neon-direct]
   try {
     const intel = new Intelligence({ skipEngine: true });
     const memory = memoryStore.getMemory(intel.data, id);
@@ -5446,6 +5448,7 @@ hooksCmd.command('memory-list').description('List memories, newest first')
   .option('-l, --limit <n>', 'Page size (max 1000)', '50')
   .option('-o, --offset <n>', 'Skip this many', '0')
   .action((opts) => {
+    if (RVN_ON) return printJsonResult({ success: false, error: 'memory-list: ' + RVN_CRUD_REFUSED }, false); // [neon-direct]
     try {
       const intel = new Intelligence({ skipEngine: true });
       const type = opts.type ? memoryStore.validateMemoryType(opts.type) : undefined;
@@ -5462,6 +5465,7 @@ hooksCmd.command('memory-update').description('Update a memory (content is re-em
   .option('-m, --metadata <json>', 'Replace metadata (JSON object)')
   .option('--semantic', 'Embed new content with ONNX (match how the store was written)')
   .action(async (id, opts) => {
+    if (RVN_ON) return printJsonResult({ success: false, error: 'memory-update: ' + RVN_CRUD_REFUSED }, false); // [neon-direct]
     const intel = new Intelligence();
     try {
       const patch = {};
@@ -5483,6 +5487,7 @@ hooksCmd.command('memory-update').description('Update a memory (content is re-em
   });
 
 hooksCmd.command('forget').description('Delete memories by id').argument('<ids...>', 'Memory ids').action((ids) => {
+    if (RVN_ON) return printJsonResult({ success: false, error: 'forget: ' + RVN_CRUD_REFUSED }, false); // [neon-direct]
   const intel = new Intelligence({ skipEngine: true });
   try {
     const result = intel.forgetMemories(recordValidate.validateIdList(ids, 'memory ids'));
