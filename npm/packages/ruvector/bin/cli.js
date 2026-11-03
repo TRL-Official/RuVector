@@ -6115,16 +6115,17 @@ hooksCmd.command('rag-context')
     // Use async recall with engine (VectorDB + HNSW)
     const memories = await intel.recallAsync(queryStr, parseInt(opts.topK));
 
-    // Rerank if requested
+    // Rerank if requested (TRL-Official fork, 2026-11-03: was a silent no-op; see bin/rerank.js)
     let results = memories;
-    if (opts.rerank && ExtendedWorkerPool) {
-      try {
-        const pool = new ExtendedWorkerPool();
-        results = await pool.rankContext(queryStr, memories.map(m => m.content || m));
-      } catch (e) {}
+    let rerank = {};
+    if (opts.rerank) {
+      loadNewModules();
+      const r = await require('./rerank.js').rerankMemories(memories, queryStr, ExtendedWorkerPool);
+      results = r.results;
+      rerank = { reranked: r.reranked, ...(r.error ? { rerank_error: r.error } : {}) };
     }
 
-    console.log(JSON.stringify({ success: true, query: queryStr, results }));
+    console.log(JSON.stringify({ success: true, query: queryStr, results, ...rerank }));
   });
 
 // Git Churn Analysis Command
