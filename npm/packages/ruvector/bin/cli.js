@@ -928,6 +928,13 @@ program
   .option('--json', 'With --list, print JSON')
   .option('--dry-run', 'Print what would be installed without installing')
   .action((names, options) => {
+    // [neon-direct] this build is pinned and locked by digital-twin (stack-pins.json, stack-locks/); an install from the
+    // CLI would write package.json and node_modules into the project (the repository root) outside that lock. --list and
+    // --dry-run only read, so they stay; RUVECTOR_ALLOW_ADD=1 lifts the refusal.
+    if (RVN_ON && !options.list && !options.dryRun && process.env.RUVECTOR_ALLOW_ADD !== '1') {
+      console.error("ruvector: 'add' is disabled in neon-direct mode: this build is pinned and locked, and an install would write package.json and node_modules into the project. Use --list or --dry-run to look (set RUVECTOR_ALLOW_ADD=1 to install anyway).");
+      process.exit(2);
+    }
     const extras = require('./extras');
 
     if (options.list) {
