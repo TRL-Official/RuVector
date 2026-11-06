@@ -24,7 +24,7 @@ const EXTRAS = Object.freeze(Object.assign(Object.create(null), {
     pkg: '@ruvector/diskann',
     spec: '@ruvector/diskann@^0.1.2',
     why: 'DiskANN/Vamana graph index with PQ, saved to disk, for indexes larger than RAM',
-    usage: "const { DiskAnnIndex } = require('ruvector'); new DiskAnnIndex({ dim })",
+    usage: 'CLI: ruvector diskann build|search; MCP: diskann_build, diskann_search; library: DiskAnnIndex',
   },
   router: {
     pkg: '@ruvector/router',
@@ -46,7 +46,7 @@ const EXTRAS = Object.freeze(Object.assign(Object.create(null), {
   },
   rvf: {
     pkg: '@ruvector/rvf',
-    spec: '@ruvector/rvf@^0.3.4',
+    spec: '@ruvector/rvf@^0.4.2',
     why: 'Persistent RVF vector stores behind `ruvector rvf` and the rvf_* MCP tools (optional dependency)',
     usage: 'npx ruvector rvf --help',
   },
