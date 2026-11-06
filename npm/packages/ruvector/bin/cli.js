@@ -8885,6 +8885,13 @@ skillsCmd.command('install [names...]')
   .option('-f, --force', 'Overwrite an existing skill of the same name')
   .option('--json', 'Output as JSON')
   .action((names, opts) => {
+    // [neon-direct] a copied skill is loaded by every later Claude Code session in the project and is committed with it, and
+    // the shipped skill tells the agent to run `npx ruvector`, which bypasses the pinned neon-direct build. digital-twin adds
+    // skills only with its operator's yes; `skills list` only reads, so it stays. RUVECTOR_ALLOW_SKILLS=1 lifts the refusal.
+    if (RVN_ON && process.env.RUVECTOR_ALLOW_SKILLS !== '1') {
+      console.error("ruvector: 'skills install' is disabled in neon-direct mode: it would add skills to the project that every later session loads. Use 'skills list' to look (set RUVECTOR_ALLOW_SKILLS=1 to install anyway).");
+      process.exit(2);
+    }
     try {
       const shipped = listShippedSkills().map((sk) => sk.name);
       const wanted = names && names.length ? names : shipped;
