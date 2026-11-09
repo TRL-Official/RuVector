@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 pub const EMBEDDED_POLICY: &str = include_str!("../../../config/weaver/weaver.toml");
 pub const EMBEDDED_CAPABILITIES: &str = include_str!("../../../config/weaver/capabilities.toml");
 pub const EMBEDDED_LEDGER: &str = include_str!("../../../config/weaver/ledger.jsonl");
+pub const EMBEDDED_TOPICS: &str = include_str!("../../../config/weaver/topics.toml");
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Policy {
@@ -32,6 +33,13 @@ pub struct LoopPolicy {
     #[serde(default)]
     pub max_new_packages_per_day: Option<usize>,
     pub max_failures: usize,
+    /// Defer a repo's lane while it has more queued + in-progress Actions
+    /// runs than this (account-wide runner caps, macOS especially).
+    #[serde(default = "default_max_active_runs")]
+    pub max_active_runs_per_repo: usize,
+    /// Branch prefixes this loop owns; only their runs are ever cancelled.
+    #[serde(default = "default_owned_prefixes")]
+    pub owned_branch_prefixes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -51,6 +59,10 @@ pub struct GatePolicy {
     pub max_age_days: i64,
     pub leak_patterns: Vec<String>,
     pub smoke_timeout_secs: u64,
+    /// Per-package regexes for paths a package ships ON PURPOSE (e.g.
+    /// agentic-flow's `.claude/`); never reported as leaks.
+    #[serde(default)]
+    pub leak_allow: std::collections::BTreeMap<String, Vec<String>>,
     /// "Lean release" bar that re-opens a candidate rejected for a heavy
     /// dependency tree once a newer version clears it.
     #[serde(default = "default_lean_deps")]
@@ -267,4 +279,12 @@ fn default_lean_deps() -> usize {
 
 fn default_lean_bytes() -> u64 {
     5_000_000
+}
+
+fn default_max_active_runs() -> usize {
+    20
+}
+
+fn default_owned_prefixes() -> Vec<String> {
+    vec!["weaver/".into(), "feat/weaver-".into()]
 }

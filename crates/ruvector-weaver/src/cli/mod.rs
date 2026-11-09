@@ -2,6 +2,9 @@
 
 mod cmds;
 mod io;
+mod seo;
+mod seo_apply;
+mod seo_report;
 mod sources;
 
 use anyhow::Result;
@@ -69,6 +72,14 @@ pub enum Cmd {
         #[arg(long)]
         seed_ledger: bool,
     },
+    /// Fresh-install top packages, `npm ls --all`, emit invalid_resolution
+    /// items naming the consumer whose range won hoisting.
+    Resolve {
+        packages: Vec<String>,
+        /// Without explicit packages: the top N npm packages by downloads.
+        #[arg(long, default_value_t = 15)]
+        top: usize,
+    },
     /// Release-regression sweep over every npm package in graph.json.
     Release {
         packages: Vec<String>,
@@ -80,6 +91,9 @@ pub enum Cmd {
         package: String,
         #[arg(long)]
         consumer: Option<String>,
+        /// The exact consumer package taking the dependency (cycle check).
+        #[arg(long)]
+        consumer_package: Option<String>,
         #[arg(long)]
         no_smoke: bool,
         /// New-package mode: source gates on --dir before the first publish.
@@ -131,6 +145,11 @@ pub enum Cmd {
     },
     /// Capability gaps -> `create` items merged into queue.json.
     ProposeNew,
+    /// Portfolio SEO / distribution layer (ADR-356).
+    Seo {
+        #[command(subcommand)]
+        op: seo::SeoOp,
+    },
 }
 
 #[derive(Subcommand)]
@@ -160,6 +179,9 @@ pub enum LedgerOp {
         /// Attach gate results from gates/<pkg>.json.
         #[arg(long)]
         gates_from: Option<String>,
+        /// Subject that must be shipped before this rejection re-opens (repeatable).
+        #[arg(long = "blocked-on")]
+        blocked_on: Vec<String>,
     },
     Show {
         #[arg(long)]
@@ -203,6 +225,7 @@ impl Ctx {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+    let config_dir = cli.config_dir.clone();
     let cfg = Config::load(cli.config_dir.as_deref(), cli.work_dir.clone())?;
     let http = Http::new(
         Some(cli.work_dir.join("http-cache")),
@@ -231,16 +254,25 @@ pub fn run() -> Result<()> {
             seed_ledger,
         } => sources::prs(&ctx, repos, all, checks, seed_ledger),
         Cmd::Release { packages, workers } => sources::release(&ctx, packages, workers),
+        Cmd::Resolve { packages, top } => sources::resolve(&ctx, packages, top),
         Cmd::Gate {
             package,
             consumer,
+            consumer_package,
             no_smoke,
             new,
             dir,
             run_tests,
             record,
         } => cmds::gate(
-            &ctx, &package, consumer, no_smoke, new, dir, run_tests, record,
+            &ctx,
+            &package,
+            (consumer, consumer_package),
+            no_smoke,
+            new,
+            dir,
+            run_tests,
+            record,
         ),
         Cmd::Queue {
             gate_top,
@@ -248,6 +280,7 @@ pub fn run() -> Result<()> {
             show,
         } => cmds::queue(&ctx, gate_top, no_create, show),
         Cmd::ProposeNew => cmds::propose_new(&ctx),
+        Cmd::Seo { op } => seo::run(&ctx, config_dir.as_deref(), op),
         Cmd::VulnEvidence {
             package,
             dir,

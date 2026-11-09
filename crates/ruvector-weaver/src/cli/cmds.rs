@@ -38,6 +38,7 @@ pub(super) fn entry(
         gates: vec![],
         location: None,
         severity: None,
+        blocked_on: vec![],
     }
 }
 
@@ -124,13 +125,17 @@ pub fn scan(ctx: &Ctx, mut repos: Vec<String>, all: bool, no_security: bool) -> 
 pub fn gate(
     ctx: &Ctx,
     package: &str,
-    consumer: Option<String>,
+    (consumer, consumer_package): (Option<String>, Option<String>),
     no_smoke: bool,
     new: bool,
     dir: Option<PathBuf>,
     run_tests: bool,
     record: bool,
 ) -> Result<()> {
+    if gate::is_packageless(package) {
+        println!("gate skipped: `{package}` is not a package (item has no candidate to gate)");
+        return Ok(());
+    }
     let g: Graph = read_json(&ctx.graph_path())?;
     let reg = NpmRegistry::new(ctx.http.clone());
     let ledger = load_ledger(ctx)?;
@@ -151,7 +156,7 @@ pub fn gate(
                 });
             }
         }
-        results.extend(gate::pack_gates(&dir, &ctx.cfg)?);
+        results.extend(gate::pack_gates(&dir, &ctx.cfg, &ctx.http)?);
         let (name, checks) = release::dir_checks(&ctx.http, &dir, &ctx.cfg.policy.npm)?;
         if name != package {
             bail!("--dir holds {name}, not {package}");
@@ -164,6 +169,7 @@ pub fn gate(
         }
         let opts = GateOptions {
             consumer: consumer.as_deref(),
+            consumer_package: consumer_package.as_deref(),
             smoke: !no_smoke,
             ledger: Some(&ledger),
         };
@@ -222,6 +228,7 @@ fn build_queue(
     let reports = scan::load_reports(&ctx.work)?;
     let ledger = load_ledger(ctx)?;
     let live = prs::load_all(&ctx.work)?;
+    let runs = ruvector_weaver::saturation::load_all(&ctx.work)?;
     Ok(queue::build(
         &ctx.cfg,
         queue::QueueInputs {
@@ -232,6 +239,7 @@ fn build_queue(
             creates: props.items.clone(),
             create_suppressed: props.suppressed.clone(),
             prs: &live,
+            runs: &runs,
         },
     ))
 }
@@ -273,6 +281,7 @@ pub fn queue(ctx: &Ctx, gate_top: usize, no_create: bool, show: usize) -> Result
         for c in todo.into_iter().take(gate_top) {
             let opts = GateOptions {
                 consumer: None,
+                consumer_package: None,
                 smoke: true,
                 ledger: Some(&ledger),
             };
@@ -328,8 +337,10 @@ pub fn ledger(ctx: &Ctx, op: LedgerOp) -> Result<()> {
             reason,
             measures,
             gates_from,
+            blocked_on,
         } => {
             let mut e = entry(&repo, candidate, subject, kind, outcome);
+            e.blocked_on = blocked_on;
             e.signal_kind = signal;
             e.pr = pr;
             e.version = version;

@@ -53,12 +53,17 @@ are skipped.
    $W graph                      # npm maintainer:ruvnet + crates.io owner; 12 h HTTP cache
    $W release                    # repo change / surface drop / open ranges per package
    $W prs --all                  # open PRs per repo (add --checks for CI rollups)
+   $W resolve --top 15           # fresh installs + npm ls --all: invalid_resolution
    $W scan <repos touched since last tick>   # daily: $W scan --all
    ```
 3. **Rank.** `$W queue --gate-top 20` writes `queue.json`: `lanes` (≤ 8, one
    per repo), `items` (each with a self-contained `brief`), `suppressed`
    (with the reason: ledger state, gate rejection, open PR already covering
    it, PR no longer open), `busy_repos`.
+0. **Run `direct` items first.** `queue.direct` lists items the tick runs
+   itself, with no agent and no lane. Today the only kind is
+   `infra:cancel-superseded`: its brief holds the exact `gh run cancel` loop,
+   which only touches runs on loop-owned branches.
 4. **Claim, then dispatch.** For each lane in `queue.lanes`:
    - record every item in the lane as `in_progress` first
      (`$W ledger record --repo R --candidate C --subject S --kind K --signal SK --outcome in_progress`)
@@ -78,6 +83,15 @@ are skipped.
 ## Hard rules every lane follows
 
 - One active lane per repo; never two agents in one repo.
+- **Branch names.** Lanes push to `weaver/<lane>-<topic>` (or `feat/weaver-*`).
+  Those are the only branches whose superseded CI runs weaver ever cancels
+  (`[loop] owned_branch_prefixes`).
+- **Actions saturation.** `weaver prs` also records each repo's queued and
+  in-progress run counts. A repo over `max_active_runs_per_repo` (default 20)
+  is listed in `busy_repos` as `gha-saturated` and gets no lane that tick.
+- **Blocked rejections.** Record a rejection that waits on other work with
+  `--outcome rejected --blocked-on <subject>` (repeatable). The queue
+  re-opens it automatically once every blocker's latest entry is `shipped`.
 - **A red main is a baseline, not a blocker.** `weaver prs` records the
   workflows already failing on each repo's default branch. Each brief lists
   them, and the repo gets its own `main_red` hygiene item. Compare your PR
@@ -99,6 +113,11 @@ are skipped.
   `weaver readme`, and the same lane wires the package into the consumer
   (no orphans). Caps per tick/day are optional knobs in `weaver.toml`
   (unset = unlimited).
+- **Gate scope.** Pass `--consumer-package <pkg>` to check a cycle from the
+  exact package that takes the dependency; without it, siblings published
+  from the candidate's own repo are ignored. Paths a package ships on purpose
+  go in `[gate.leak_allow]`. Leak paths the previous version already carried
+  are reported, and only NEW ones fail.
 - **Release gate.** Before any publish of an existing name:
   `$W gate <pkg> --dir <pkg dir>`. It refuses (exit 2) on repository change,
   sharp file/size/export drop, or open-ended ecosystem ranges, unless the
@@ -138,7 +157,68 @@ create when no capability covers it; `undeclared_import` / `unused_declared`
 land / close_with_ledger; `release_regression` -> release_fix. A rejection
 whose reason is a heavy dependency tree is re-queued automatically once the
 candidate ships a release under the size/dep bar in `weaver.toml [gate]`.
+`weaver resolve` installs the top packages fresh and runs `npm ls --all`.
+It emits `invalid_resolution` for every dependency whose resolved version
+breaks a declared range, and the lane goes to the consumer whose range won
+hoisting (for example, metaharness `^2.5.6` beat ruvector `^4.1.0` for
+`@ruvector/ruvllm`).
 `weaver release` also emits `fix_unreachable` (a dependent's declared range
 excludes the version carrying a shipped security fix in the ledger; queue a
 bump) and `zero_caret` (a `^0.y` / `~0.y` range that already misses the
 dep's current release, because 0.x carets act as pins).
+
+## SEO / distribution layer (ADR-356)
+
+`weaver seo` sets the portfolio metadata standard: `homepage https://ruv.io`,
+canonical `repository` (with `directory`) and `bugs`, 8 to 20 taxonomy
+keywords, and a description of at most 200 characters containing the
+primary topic phrase. READMEs carry install / quick-start, a
+"Works with / Used by" block built from REAL dependency edges, a ruv.io
+footer and, for flagships, an animated flow SVG. Nothing in this layer adds
+a dependency.
+
+The taxonomy lives in `config/weaver/topics.toml`. Each topic carries its
+measured demand. Brand and niche terms are legal keywords but never primary
+topics.
+
+```bash
+$W seo demand --taxonomy --record     # re-measure npm keyword totals + GitHub topic counts -> ledger seo:topic:<t>
+$W seo audit --all [--smoke-stale]    # -> /data/scratch/weaver/seo-audit.json + ranked table (downloads x issues)
+$W seo baseline --inventory /data/scratch/weaver/seo/npm-inventory-2026-11-08.json \
+   --plan /data/scratch/weaver/seo/distribution-plan.md   # -> seo/baseline.json (405 rows, unknowns explicit)
+$W seo propose <pkg> | --repo owner/name | --all [--checkout <dir>]   # exact diffs, nothing written
+$W seo apply --repo owner/name --repo-level        # gh repo edit: homepage + topics (replace, <= 20), read back
+$W seo apply --repo owner/name --top 5 | --packages a,b   # branch + PR with patch bumps; never publishes
+```
+
+Rules:
+
+- **Repo settings belong to this lane.** Repo-level Website and topics are
+  changed only by this lane. `apply --repo-level` writes a
+  `seo:repo-settings` ledger entry (outcome `gated`) holding the old
+  homepage, the old topics and the exact revert command BEFORE it runs
+  `gh repo edit`. After reading the values back it writes a second entry,
+  `shipped` or `failed`.
+- **Never publish from `apply`.** npm renders the tarball README, so package
+  metadata goes live only on a republish. Merge the PR, then publish through
+  the repo's documented release path and the ADR-355 release gates.
+  Stagger publishes at no more than about 10 per hour.
+- **After every publish, verify from the registry:**
+  `npm view <pkg> version homepage keywords`, `npm view <pkg> readme | head`,
+  then a clean install and import.
+- **Respect `hands_off_packages` / `hands_off_repos` in topics.toml.**
+  Another lane owns those, so `apply` refuses them. Hand the `propose` output
+  to the owning lane instead.
+- **Fold metadata into an open release.** When another lane's release PR is
+  open on the same package, fold the metadata into that release instead of
+  opening a competing patch bump.
+- **Stale packages.** For a package over 180 days old with under 1k
+  downloads/month, `seo-audit.json .stale_low_download` gives one of:
+  refresh+republish (imports cleanly and has a real consumer),
+  fix+republish, a deprecate-candidate (import fails AND it has no consumer;
+  the owner deprecates with 2FA after a migration audit), or leave as-is.
+  Never deprecate on downloads or name alone.
+- **Pilots** (`@ruvector/kge`, `@ruvector/rvf-mcp-server`): measure cold
+  install against the pinned prior version and record it with
+  `--measure cold_install_bytes=<n>:bytes@<prior>`. A regression above 5%
+  is rejected.

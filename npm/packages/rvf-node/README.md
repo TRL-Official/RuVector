@@ -163,6 +163,8 @@ const results = db.query(
 | `efSearch` | `number` | `100` | HNSW search quality (higher = better recall, slower) |
 | `filter` | `string` | — | Filter expression as JSON string |
 | `timeoutMs` | `number` | `0` | Query timeout in ms (0 = no timeout) |
+| `rabitq` | `boolean` | `false` | Opt in to the RaBitQ two-stage path (1-bit scan + exact rescore) |
+| `forceExact` | `boolean` | `false` | Exact brute-force scan, no HNSW. Filtered queries are already exact when the filter is selective (<15%) or the graph measures below 0.95 recall@10 |
 
 ### Filter Expressions
 
@@ -357,3 +359,18 @@ The Rust crate powering this package is [`rvf-runtime`](https://crates.io/crates
 ## License
 
 MIT
+
+<!-- weaver:seo:links:start -->
+## Works with / Used by
+
+Part of the [ruv.io](https://ruv.io) open-source stack for vector database, N-API, HNSW.
+
+- **Works with** (its runtime dependencies): no other ruvnet package (standalone)
+- **Used by** (published packages that depend on it): [`@ruvector/rvf`](https://www.npmjs.com/package/@ruvector/rvf), [`agentdb`](https://www.npmjs.com/package/agentdb), [`agenticow`](https://www.npmjs.com/package/agenticow)
+<!-- weaver:seo:links:end -->
+
+<!-- weaver:seo:footer:start -->
+---
+
+Built by [rUv](https://ruv.io) · [ruv.io](https://ruv.io) · [Source](https://github.com/ruvnet/ruvector)
+<!-- weaver:seo:footer:end -->

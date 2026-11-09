@@ -155,6 +155,7 @@ fn entry(
         gates: vec![],
         location: None,
         severity: None,
+        blocked_on: vec![],
     }
 }
 
@@ -387,6 +388,7 @@ fn ranking_one_lane_per_repo_with_batching() {
             creates: vec![],
             create_suppressed: vec![],
             prs: &[],
+            runs: &[],
         },
     );
     assert_eq!(q.lanes.len(), 2);
@@ -461,6 +463,7 @@ fn busy_repo_lane_is_deferred_and_ledger_pairs_suppressed() {
             creates: vec![],
             create_suppressed: vec![],
             prs: &[],
+            runs: &[],
         },
     );
     assert!(q.lanes.is_empty());
@@ -501,6 +504,7 @@ fn failed_gate_rejects_candidate() {
             creates: vec![],
             create_suppressed: vec![],
             prs: &[],
+            runs: &[],
         },
     );
     assert!(q
@@ -820,6 +824,7 @@ fn open_prs_become_items_and_block_duplicate_work() {
             creates: vec![],
             create_suppressed: vec![],
             prs: &live,
+            runs: &[],
         },
     );
     let kinds: BTreeSet<_> = q
@@ -1074,6 +1079,7 @@ fn heavy_rejection_requeues_on_lean_release() {
             creates: vec![],
             create_suppressed: vec![],
             prs: &[],
+            runs: &[],
         },
     );
     assert!(q.items.is_empty());
@@ -1096,6 +1102,7 @@ fn heavy_rejection_requeues_on_lean_release() {
             creates: vec![],
             create_suppressed: vec![],
             prs: &[],
+            runs: &[],
         },
     );
     let it = q
@@ -1118,6 +1125,7 @@ fn heavy_rejection_requeues_on_lean_release() {
             creates: vec![],
             create_suppressed: vec![],
             prs: &[],
+            runs: &[],
         },
     );
     assert!(q.items.is_empty());
@@ -1150,6 +1158,7 @@ fn renamed_repos_share_one_lane_and_one_ledger_history() {
             creates: vec![],
             create_suppressed: vec![],
             prs: &[],
+            runs: &[],
         },
     );
     assert!(q.busy_repos.contains_key("ruvnet/ruflo"));
@@ -1325,4 +1334,316 @@ fn vuln_evidence_distinguishes_nested_stale_copies() {
         &resolved_copies(&clean, "@ruvector/sona", "<0.1.9"),
     );
     assert!(!bad && why.contains("outside the affected range"));
+}
+
+#[test]
+fn invalid_resolution_names_the_winning_consumer() {
+    use ruvector_weaver::resolve;
+    let tree = serde_json::json!({"dependencies": {
+        "ruvector": {"version": "0.3.13", "dependencies": {
+            "@ruvector/ruvllm": {"version": "2.7.0", "invalid": "\"^4.1.0\" from node_modules/ruvector"}
+        }},
+        "metaharness": {"version": "0.4.20", "dependencies": {
+            "@ruvector/ruvllm": {"version": "2.7.0"}
+        }}
+    }});
+    let mut g = graph_with(&[("ruvnet/ruvector", 10), ("ruvnet/metaharness", 10)]);
+    for p in &mut g.packages {
+        let r = if p.name == "ruvector" {
+            "^4.1.0"
+        } else {
+            "^2.5.6"
+        };
+        p.dep_ranges.insert("@ruvector/ruvllm".into(), r.into());
+    }
+    let s = resolve::signals(&g, "ruvector", &tree);
+    assert_eq!(s.len(), 1);
+    assert_eq!(
+        s[0].repo, "ruvnet/metaharness",
+        "the lane belongs to the range that must move"
+    );
+    assert_eq!(
+        s[0].subject.as_deref(),
+        Some("release:invalid_resolution:ruvector->@ruvector/ruvllm")
+    );
+    assert!(s[0].evidence.ends_with("won by metaharness"));
+    let clean = serde_json::json!({"dependencies": {"ruvector": {"version": "0.3.13"}}});
+    assert!(resolve::signals(&g, "ruvector", &clean).is_empty());
+}
+
+#[test]
+fn blocked_rejection_requeues_only_when_every_blocker_ships() {
+    let c = cfg();
+    let g = graph_with(&[("ruvnet/agentdb", 10), ("ruvnet/ruvector", 10)]);
+    let mut l = Ledger::default();
+    let mut e = entry(
+        "ruvnet/agentdb",
+        Some("@ruvector/rvf"),
+        Some("agentdb:rvf-0.4-migration"),
+        WorkKind::Integrate,
+        SignalKind::StubMarker,
+        Outcome::Rejected,
+    );
+    e.blocked_on = vec![
+        "rvf:per-vector-metadata".into(),
+        "rvf:vector-readback".into(),
+    ];
+    l.entries.push(e);
+    let build = |l: &Ledger| {
+        queue::build(
+            &c,
+            queue::QueueInputs {
+                graph: &g,
+                reports: &[],
+                ledger: l,
+                gates: &BTreeMap::new(),
+                creates: vec![],
+                create_suppressed: vec![],
+                prs: &[],
+                runs: &[],
+            },
+        )
+    };
+    let has = |q: &Queue| {
+        q.items
+            .iter()
+            .any(|i| i.subject.as_deref() == Some("agentdb:rvf-0.4-migration"))
+    };
+    assert!(!has(&build(&l)), "no blocker shipped");
+    l.entries.push(entry(
+        "ruvnet/ruvector",
+        Some("@ruvector/rvf"),
+        Some("rvf:per-vector-metadata"),
+        WorkKind::Replace,
+        SignalKind::StubMarker,
+        Outcome::Shipped,
+    ));
+    assert!(!has(&build(&l)), "one of two blockers shipped");
+    assert_eq!(
+        ruvector_weaver::requeue::open_blockers(&l, &l.entries[0]),
+        vec!["rvf:vector-readback"]
+    );
+    l.entries.push(entry(
+        "ruvnet/ruvector",
+        Some("@ruvector/rvf"),
+        Some("rvf:vector-readback"),
+        WorkKind::Replace,
+        SignalKind::StubMarker,
+        Outcome::Shipped,
+    ));
+    let q = build(&l);
+    let it = q
+        .items
+        .iter()
+        .find(|i| i.subject.as_deref() == Some("agentdb:rvf-0.4-migration"))
+        .expect("re-queued");
+    assert!(it.evidence[0]
+        .evidence
+        .starts_with("re-queued: every blocker shipped"));
+    // blocked_on round-trips through JSONL and stays off entries without it.
+    let line = serde_json::to_string(&l.entries[0]).unwrap();
+    assert!(line.contains("\"blocked_on\""));
+    assert!(!serde_json::to_string(&l.entries[1])
+        .unwrap()
+        .contains("blocked_on"));
+}
+
+#[test]
+fn saturated_repos_are_deferred_and_only_owned_superseded_runs_are_cancelled() {
+    use ruvector_weaver::saturation::{self, RepoRuns, RunRef};
+    let run = |id: u64, wf: &str, br: &str, n: u64| RunRef {
+        id,
+        workflow: wf.into(),
+        branch: br.into(),
+        run_number: n,
+        status: "queued".into(),
+    };
+    let active = vec![
+        run(1, "Build Native", "weaver/lane-a", 10),
+        run(2, "Build Native", "weaver/lane-a", 11),
+        run(3, "Build Native", "main", 7),
+        run(4, "Build Native", "main", 8),
+        run(5, "CI", "feat/someone-else", 1),
+        run(6, "CI", "feat/someone-else", 2),
+        run(7, "CI", "weaver/lane-a", 3),
+    ];
+    let owned = cfg().policy.lp.owned_branch_prefixes.clone();
+    let sup = saturation::superseded(&active, &owned);
+    assert_eq!(
+        sup.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![1],
+        "only the older owned run of the same workflow+branch"
+    );
+    let c = cfg();
+    let reports = vec![report_for("ruvnet/big"), report_for("ruvnet/small")];
+    let g = graph_with(&[("ruvnet/big", 1000), ("ruvnet/small", 10)]);
+    let runs = vec![
+        RepoRuns {
+            repo: "ruvnet/big".into(),
+            fetched_at: String::new(),
+            queued: 30,
+            in_progress: 4,
+            superseded: sup,
+        },
+        RepoRuns {
+            repo: "ruvnet/small".into(),
+            fetched_at: String::new(),
+            queued: 1,
+            in_progress: 0,
+            superseded: vec![],
+        },
+    ];
+    let q = queue::build(
+        &c,
+        queue::QueueInputs {
+            graph: &g,
+            reports: &reports,
+            ledger: &Ledger::default(),
+            gates: &BTreeMap::new(),
+            creates: vec![],
+            create_suppressed: vec![],
+            prs: &[],
+            runs: &runs,
+        },
+    );
+    assert!(q.busy_repos["ruvnet/big"][0].starts_with("gha-saturated: 30 queued + 4 in progress"));
+    assert!(q.lanes.iter().all(|l| l.repo != "ruvnet/big"));
+    assert!(q.lanes.iter().any(|l| l.repo == "ruvnet/small"));
+    assert_eq!(q.direct.len(), 1);
+    let cancel = q.items.iter().find(|i| i.id == q.direct[0]).unwrap();
+    assert!(cancel.brief.contains("gh run cancel") && cancel.brief.contains("for id in 1;"));
+    assert!(!cancel.brief.contains(" 3 ") && !cancel.brief.contains(" 5 "));
+}
+
+#[test]
+fn leak_scan_allows_intentional_dirs_and_only_fails_new_paths() {
+    use ruvector_weaver::checks::{classify_leaks, leak_result};
+    let c = cfg();
+    let files: Vec<String> = [
+        ".claude/skills/a.md",
+        ".claude/agents/b.md",
+        "dist/index.js",
+        ".env",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    // agentic-flow ships .claude/ on purpose (config allowlist).
+    let r = leak_result(&c, "agentic-flow", &files[..3], None).unwrap();
+    assert!(r.passed, "{}", r.detail);
+    assert!(r.detail.contains("2 allowlisted"));
+    // Another package: .claude/ carried over from the previous version passes...
+    let prev: Vec<String> = files[..3].to_vec();
+    let r = leak_result(&c, "other-pkg", &files[..3], Some(("1.2.3", &prev))).unwrap();
+    assert!(
+        r.passed && r.detail.contains("2 carried over from 1.2.3"),
+        "{}",
+        r.detail
+    );
+    // ...but a NEW leak path (.env) fails, even alongside allowlisted ones.
+    let r = leak_result(&c, "agentic-flow", &files, Some(("3.3.1", &prev))).unwrap();
+    assert!(
+        !r.passed && r.detail.contains("NEW leak paths: .env"),
+        "{}",
+        r.detail
+    );
+    let (new, carried, allowed) = classify_leaks(&files, &[], None).unwrap();
+    assert_eq!((new.len(), carried.len(), allowed.len()), (4, 0, 0));
+}
+
+#[test]
+fn no_cycle_uses_the_published_graph_and_ignores_repo_siblings() {
+    use ruvector_weaver::checks::cycle_result;
+    // agent-booster is published from ruvnet/agentic-flow and depends only on express.
+    let mut g = graph_with(&[("ruvnet/agentic-flow", 10), ("ruvnet/agentic-flow", 10)]);
+    g.packages[0].name = "agentic-flow".into();
+    g.packages[0].dependencies = vec!["agent-booster".into()];
+    g.packages[0]
+        .dep_ranges
+        .insert("agent-booster".into(), "^0.2.2".into());
+    g.packages[1].name = "agent-booster".into();
+    g.packages[1].dependencies = vec!["express".into()];
+    g.consumer_repos = consumer_repos(&g.packages);
+    let r = cycle_result(&g, "agentic-flow", "ruvnet/agentic-flow", None);
+    assert!(r.passed, "intra-repo is not a cycle: {}", r.detail);
+    let r = cycle_result(
+        &g,
+        "agent-booster",
+        "ruvnet/agentic-flow",
+        Some("agentic-flow"),
+    );
+    assert!(
+        r.passed,
+        "agent-booster does not depend on agentic-flow: {}",
+        r.detail
+    );
+    // A real published cycle is still caught, with the declared ranges as evidence.
+    g.packages[1].dependencies.push("agentic-flow".into());
+    g.packages[1]
+        .dep_ranges
+        .insert("agentic-flow".into(), "^3.0.0".into());
+    let r = cycle_result(
+        &g,
+        "agent-booster",
+        "ruvnet/agentic-flow",
+        Some("agentic-flow"),
+    );
+    assert!(
+        !r.passed && r.detail.contains("agent-booster -> agentic-flow@^3.0.0"),
+        "{}",
+        r.detail
+    );
+}
+
+// ---- package-less items -----------------------------------------------------
+
+#[test]
+fn packageless_items_are_never_gated() {
+    use ruvector_weaver::brief::brief;
+    use ruvector_weaver::gate::is_packageless;
+    assert!(is_packageless("-"));
+    assert!(is_packageless(" - "));
+    assert!(is_packageless(""));
+    assert!(!is_packageless("ruvector"));
+    assert!(!is_packageless("@ruvector/core"));
+
+    let mut item = WorkItem {
+        id: "ci".into(),
+        kind: WorkKind::Hygiene,
+        status: LaneStatus::Deferred,
+        repo: "ruvnet/big".into(),
+        subject: Some("ci:main-red".into()),
+        candidate: None,
+        signal_kind: SignalKind::MainRed,
+        score: 0.0,
+        evidence: vec![],
+        gates: vec![],
+        disclosure: "public_pr".into(),
+        required_test: String::new(),
+        brief: String::new(),
+    };
+    let g = Graph::default();
+    assert!(!brief(&item, &g, None).contains("weaver gate"));
+    item.candidate = Some("-".into());
+    assert!(!brief(&item, &g, None).contains("weaver gate"));
+    item.candidate = Some("ruvector".into());
+    assert!(brief(&item, &g, None).contains("weaver gate ruvector --consumer ruvnet/big"));
+}
+
+#[test]
+fn gate_cli_skips_packageless_item() {
+    let work = std::env::temp_dir().join(format!("weaver-gate-skip-{}", std::process::id()));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_weaver"))
+        .args(["--work-dir"])
+        .arg(&work)
+        .args(["--cache-ttl-hours", "0", "gate", "-"])
+        .output()
+        .expect("run weaver");
+    let _ = std::fs::remove_dir_all(&work);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("gate skipped"));
 }
