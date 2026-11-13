@@ -8,9 +8,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Memory-backed Rust batches validate all vector dimensions before storing any
 - Count undirected edge weights once when scoring modularity in the npm
   graph helpers and returned minimum-cut partitions. Single-edge and
   disconnected-component scores now use the correct total edge weight.
+
+## [ruvector 0.3.23] - 2026-11-10
+### Fixed
+- `LearningEngine.import()` accepts state without the `neural` field again.
+  0.3.22 typed its parameter as the full `export()` return type, so TypeScript
+  code passing state exported by, or typed against, 0.3.21 stopped compiling.
+  `neural` is now optional (`LearningEngineImportState`); runtime behaviour is
+  unchanged. A type-level test compiles a 0.3.21 `export()` shape.
+- `@ruvector/edge-full` source: `modules.onnx.size` and `totalSize.withOnnx`
+  report the current ONNX wasm size (10.2MB, 11.5MB with ONNX) instead of
+  7.1MB / 8.4MB (not republished).
+
+## [ruvector 0.3.22] - 2026-11-10
+### Added
+- `neural-q` learning algorithm: a small MLP Q-function (hashed state features,
+  64-32-|actions|) trained with AdamW on the experience buffer, so routing
+  generalises to states the tabular Q-table has never seen. Available in
+  `LearningEngine`, `ruvector hooks learning-config -a neural-q` and the
+  `hooks_learning_config` MCP tool. It runs on the optional peer `ruv-fann`
+  (`npm i ruv-fann@0.1.0`); without it `neural-q` behaves exactly like
+  `q-learning`. The default install is unchanged. Held-out benchmark
+  (`scripts/neural-q-bench.js`, 9 agents, 5 seeds): unseen-state routing
+  accuracy 0.924 vs 0.204 (route keys) and 0.597 vs 0.203 (free-text states)
+  for neural-q vs q-learning; about 7 us per decision vs about 1 us.
+
+## [rvf-runtime 0.5.5] - 2026-11-10
+### Added
+- `RvfStore::should_compact`, `should_compact_with` and
+  `compact_if_needed` wire the spec 10 §7 compaction policy (dead space,
+  segment count, interval, emergency ratio) into the store. The policy and
+  `compaction::{CompactionThresholds, CompactionDecision, evaluate_triggers}`
+  were implemented and tested but unreachable (#755, from #753).
+
+## [ruvector-sona 0.2.5, ruvector-graph 2.3.5] - 2026-11-10
+### Fixed
+- `MicroLoRA::set_weights` rejects NaN/Inf in either projection before
+  changing any state, so corrupt external weights cannot poison an adapter
+  (#1472, from #375).
+- `GraphDB::delete_edge` and `delete_edges_batch` persist the deletion
+  before touching memory and indexes, so a storage error no longer leaves
+  memory and disk disagreeing (#1472, from #375).
+
+### Documentation
+- ruvector-graph README quickstart rewritten against the real `GraphDB` /
+  `NodeBuilder` / `EdgeBuilder` API (it used types that do not exist).
+
+## [ruvector 0.3.21, ruvector-cli 2.3.1] - 2026-11-10
+### Fixed
+- `rvlite_sql`, `rvlite_cypher` and `rvlite_sparql` MCP tools work. They
+  constructed a nonexistent `rvlite.Database` (the class is `RvLite`), did
+  not await the async query methods, and stripped `( ) { } ' "` from queries
+  with a shell sanitizer although queries never reach a shell. `db_path`
+  stays confined to the working directory and is loaded, never written
+  back (#1463).
+- Both MCP servers (`ruvector mcp start` and `ruvector-mcp`) answer
+  `resources/templates/list` with an empty list instead of -32601, which
+  clients such as Continue treat as fatal during setup (#1464, from #217).
 
 ## [ruvector 0.3.20] - 2026-11-09
 ### Fixed
@@ -78,6 +136,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   skill and installs it into `.claude/skills` (Claude Code) and/or
   `.agents/skills` (Codex). `skills/` is now in the published files.
 ### Fixed
+- Keep generated memory-storage IDs from overwriting live caller-selected rows, reserve explicit IDs in mixed batches, and refuse generated-counter wraparound while preserving intentional explicit upserts.
+- Preserve current HNSW caller IDs across replacements and deletion, widen live top-k retrieval when obsolete graph rows crowd candidates, and repair stale reverse mappings when restoring older snapshots.
 - Every open-ended `>=` peer range is now bounded. `@ruvector/ruvllm >=2.0.0`
   resolved to 4.0.1, a different product published under the same name
   without the runtime that `ruvector llm` / `ruvector sona` load (`ruvllm.RuvLLM is
