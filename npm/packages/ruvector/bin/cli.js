@@ -9181,6 +9181,15 @@ diskannCmd.command('search <dir>')
 
 // Weight registry (optional peer @ruvector/weight-space, loaded inside the actions)
 require('./weights').registerWeightsCommands(program, chalk);
+// [neon-direct] every `weights` command (save, nearest, diff, lineage, get) opens a weight registry file in the project
+// (default .ruvector/weights.jsonl): a local store outside Neon that the Stop hook would commit, and nothing in digital-twin
+// uses it. Refused in neon mode, like `skills install`; RUVECTOR_ALLOW_WEIGHTS=1 lifts the refusal.
+program.commands.find((c) => c.name() === 'weights')?.hook('preAction', () => {
+  if (RVN_ON && process.env.RUVECTOR_ALLOW_WEIGHTS !== '1') {
+    console.error("ruvector: 'weights' is disabled in neon-direct mode: it keeps a weight registry file in the project (.ruvector/weights.jsonl), outside Neon (set RUVECTOR_ALLOW_WEIGHTS=1 to use it anyway).");
+    process.exit(2);
+  }
+});
 
 const mcpCmd = program.command('mcp').description('MCP (Model Context Protocol) server for Claude Code integration');
 
