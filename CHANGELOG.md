@@ -1,17 +1,75 @@
 # Changelog
 
+- RvLite CLI persists literal vector IDs such as __proto__ and requires own records for get/delete, preventing silent data loss and phantom inherited IDs; automatic allocation skips occupied caller IDs and refuses exhausted counters.
+
 All notable changes to RuVector will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [@ruvector/core 0.2.0] - Unreleased
+### Changed (breaking)
+- `new VectorDb({ dimensions })` and `VectorDb.withDimensions(n)` without
+  `storagePath` now create an in-memory database private to that instance
+  (issue #1063). They used to open a shared `./ruvector.db` in the working
+  directory, so every such instance shared one store and its stored dimension
+  silently overrode the requested one: a 4-dim index created after a 256-dim one
+  accepted construction, then failed every insert with `Dimension mismatch`.
+  **Upgrading:** to keep an existing implicit store, pass
+  `storagePath: './ruvector.db'`. When `storagePath` is omitted and that file
+  exists, the binding prints a one-time warning to stderr.
+- Opening an existing store whose stored `dimensions` differ from the requested
+  ones now throws in the constructor, naming the path and both values. An
+  explicitly passed `distanceMetric` is checked the same way; an omitted one
+  keeps the stored metric, so reopening a non-Cosine store without restating the
+  metric still works.
+- Needs native `ruvector-core-*` platform packages built from this change;
+  publish them at the same version and bump the `optionalDependencies` pins.
+  Published as 0.2.0 rather than 0.1.x so caret (`^0.1.x`) dependents do not
+  pick up the new default silently.
+
+## [ruvector-core] - Unreleased
+### Added
+- `VectorDB::open_checked(options, ConfigCheck)` and `ConfigCheck`
+  (`ALL`, `DIMENSIONS`, `NONE`): open or create a database, failing with
+  `InvalidParameter` when an existing store's `dimensions` and/or
+  `distance_metric` differ from the requested ones instead of adopting them. A
+  legacy file holding vectors but no stored config is checked against a stored
+  vector's length before the requested config is written into it.
+### Changed
+- `VectorDB::new` keeps its documented behaviour (the stored configuration is
+  adopted) and now logs a `tracing` warning when the stored `dimensions` or
+  `distance_metric` differ from the requested ones.
+
 ## [Unreleased]
 
+### Fixed (Python SDK)
+- Python LangChain adapter: duplicate caller IDs in one batch are rejected before inserting vectors, preventing rows that cannot be deleted through the adapter.
+- Python Collection persistence binds new sidecars to their index bytes with a SHA-256 digest, rejecting mixed file pairs after an interrupted index replacement. Legacy sidecars remain readable without this integrity guarantee.
+- Python MCP tools evict mutated collection state after a failed save so rejected writes cannot leak into reads or later retries.
+- Python MCP: refuse collection creation when a native index already exists without its sidecar, preserving partially restored data.
+- Python MCP: discover persisted collections from their metadata sidecars, including empty RaBitQ collections, and omit incomplete native-index files.
+- Python LlamaIndex searches apply node, document, and metadata restrictions before selecting the nearest top-k results. Empty document restrictions now return no results.
+- Python LlamaIndex IS_EMPTY filters now include absent and null metadata fields, matching the framework contract alongside existing empty-string and empty-list handling.
+- Python Agentforce routes: enforce the configured per-collection vector cap before upserting, consistently with MCP writes.
+- Python Salesforce ingestion: reject incomplete pages without cursors and repeated pagination cursors rather than returning partial results or looping.
+- Python RaBitQ identity integrity also ignores missing deletions and preserves IDs, metadata, and subsequent insertion identities through vacuum, keeping adapter document maps valid.
+- Python RaBitQ export and persistence retain caller-supplied external IDs instead of substituting internal row positions, preserving associated Collection metadata through save/load.
+- Python CLI: empty insert-batch inputs now report zero inserted rows successfully instead of indexing an empty ID list.
+- Python graph queries preserve unknown null predicates through comparisons, NOT, AND, OR and XOR, preventing missing properties from being admitted by negation; integer equality and ordering retain precision beyond the float mantissa.
+- Validate Python GNN checkpoint declarations, tensor layout and finite parameters before loading while preserving valid serialized learned weights.
+
 ### Fixed
+- RvLite: acquire browser writer leases in a committed atomic IndexedDB transaction and prevent expired holders from overwriting or releasing successor leases.
+- RvLite CLI refuses corrupt or unreadable existing databases instead of reporting empty data or overwriting recoverable bytes.
 - Memory-backed Rust batches validate all vector dimensions before storing any
+- `rvf_store_open` refuses a malformed or dimensionless `.rvf` buffer instead of skipping the bad segment and allocating a dimension-1 store.
 - Count undirected edge weights once when scoring modularity in the npm
   graph helpers and returned minimum-cut partitions. Single-edge and
   disconnected-component scores now use the correct total edge weight.
+- npm rvf WASM queries use the metric stored on the database. Passing zero to `rvf_store_query` forced L2, so cosine and inner-product stores ranked with the wrong distance.
+- npm rvf rejects a batch whose rows do not match the store dimension before flattening, so a short vector cannot pad into the next row.
+- npm rvf keeps a quarantined id-map sidecar refused on the next open until a valid mapping is restored. A fresh store with no quarantine still opens.
 
 ## [ruvector 0.3.23] - 2026-11-10
 ### Fixed
