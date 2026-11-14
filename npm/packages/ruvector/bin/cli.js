@@ -7196,7 +7196,18 @@ hooksCmd.command('verify')
 
     // Check 2: .ruvector directory
     const ruvectorDir = path.join(process.cwd(), '.ruvector');
-    if (fs.existsSync(ruvectorDir)) {
+    if (RVN_ON) {
+      // [neon-direct] the intelligence store is Neon, never a local intelligence.json: check the store itself
+      try {
+        if (rvn().exists()) {
+          checks.push({ name: 'Intelligence store', status: 'pass', detail: `Neon (${process.env.RVN_STORE_NAME || 'ruvector-intel'}): ${rvn().rows.count('memories')} memories, ${rvn().rows.count('trajectories')} trajectories` });
+        } else {
+          checks.push({ name: 'Intelligence store', status: 'warn', detail: 'Neon store is empty: it is filled on first use' });
+        }
+      } catch (e) {
+        checks.push({ name: 'Intelligence store', status: 'fail', detail: `Neon store check failed: ${String((e && e.message) || e).split('\n')[0].slice(0, 120)}` });
+      }
+    } else if (fs.existsSync(ruvectorDir)) {
       checks.push({ name: 'Data directory', status: 'pass', detail: '.ruvector/ exists' });
       const intelFile = path.join(ruvectorDir, 'intelligence.json');
       if (fs.existsSync(intelFile)) {
