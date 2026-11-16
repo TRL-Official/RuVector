@@ -6971,11 +6971,23 @@ hooksCmd.command('subscribe')
       }
     };
 
+    // [neon-direct] in neon mode there is no intelligence.json to poll: read the store (its non-lazy document, and the
+    // lazy collections' counts) so the stream reflects what other processes learn
+    const readState = () => {
+      if (RVN_ON) {
+        const d = rvn().load() || {};
+        const count = (c) => { try { return rvn().rows.count(c); } catch { return 0; } };
+        return { stats: { ...(d.stats || {}), total_patterns: Object.keys(d.patterns || {}).length,
+          total_memories: count('memories'), total_trajectories: count('trajectories') }, learning: d.learning };
+      }
+      if (!fs.existsSync(dataPath)) return null;
+      return JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
+    };
+
     const check = () => {
       try {
-        if (!fs.existsSync(dataPath)) return;
-
-        const data = JSON.parse(fs.readFileSync(dataPath, 'utf-8'));
+        const data = readState();
+        if (!data) return;
         const stats = data.stats || {};
         const learning = data.learning?.stats || {};
 
@@ -7358,12 +7370,15 @@ hooksCmd.command('export')
   .option('--include-all', 'Include all data (patterns, memories, trajectories)')
   .action((opts) => {
     const intel = new Intelligence();
+    // [neon-direct] memories and trajectories are lazy in neon mode (never loaded whole), so intel.data holds none of
+    // them: read every row from the store, in pages, instead of exporting an empty list without a word
+    const lazyAll = (coll) => (RVN_ON ? rvn().rows.all(coll) : (intel.data?.[coll] || []));
     const exportData = {
       version: '1.0',
       exported_at: new Date().toISOString(),
       patterns: intel.data?.patterns || {},
-      memories: opts.includeAll ? (intel.data?.memories || []) : [],
-      trajectories: opts.includeAll ? (intel.data?.trajectories || []) : [],
+      memories: opts.includeAll ? lazyAll('memories') : [],
+      trajectories: opts.includeAll ? lazyAll('trajectories') : [],
       errors: intel.data?.errors || {},
       stats: intel.stats()
     };
@@ -7375,6 +7390,13 @@ hooksCmd.command('export')
     console.log(chalk.dim(`   ${Object.keys(exportData.patterns).length} patterns`));
     console.log(chalk.dim(`   ${exportData.memories.length} memories`));
     console.log(chalk.dim(`   ${exportData.trajectories.length} trajectories`));
+    // an export that holds fewer records than the store reports is said out loud, never silent
+    if (opts.includeAll) {
+      const st = exportData.stats || {};
+      for (const [k, n] of [['memories', st.total_memories], ['trajectories', st.total_trajectories]]) {
+        if (Number.isFinite(n) && exportData[k].length < n) console.error(chalk.yellow(`⚠ exported ${exportData[k].length} ${k}, but the store reports ${n}`));
+      }
+    }
   });
 
 // Import intelligence data

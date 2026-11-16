@@ -466,7 +466,15 @@ class Intelligence {
     return resolveIntelStorePath();
   }
 
+  // [neon-direct] in neon mode there is no file whose mtime could change: the store's fingerprint of its non-lazy rows
+  // (count, max seq, sum of versions: patterns, error fixes, co-edits, ...) changes whenever any process writes one, so
+  // refreshIfChanged() reloads what CLI hooks learned after this server started. If the store cannot answer, keep the
+  // last token (serve from memory) rather than reload in a loop.
   diskMtimeMs() {
+    if (RVN_ON) {
+      try { const f = rvn().fpStmt(); const r = rvn().query(f.text, f.params)[0] || {}; return `${r.n}:${r.s}:${r.v}`; }
+      catch { return this.loadedMtimeMs; }
+    }
     try { return fs.statSync(this.intelPath).mtimeMs; } catch { return 0; }
   }
 
