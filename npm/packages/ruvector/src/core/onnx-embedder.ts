@@ -31,6 +31,7 @@ import {
   requireModelPrefixSpec,
 } from './embedding-provenance';
 import { createHash } from 'crypto';
+import * as net from 'net';
 
 // Extend globalThis type for ESM require compatibility
 declare global {
@@ -119,6 +120,134 @@ let loadedEmbeddingSpaceIdentity: EmbeddingSpaceIdentity | null = null;
 
 // Default model
 const DEFAULT_MODEL = 'all-MiniLM-L6-v2';
+
+// ---------------------------------------------------------------------------------------------------------------
+// neon-direct (TRL-Official fork, 2026-11-20): the container's connection holder already keeps this module loaded
+// and answers {kind:'embed', fn, args} on its unix socket (digital-twin neon-direct/neon-holder.mjs). A CLI process
+// that loads MiniLM itself pays ~0.65 s per call; asking the holder costs one round trip. The holder runs THIS module
+// with the same default options, so its vectors are byte-identical; its identity answer is the one a local load
+// derives. Used only when:
+//   - NEON_HOLDER_SOCK names a socket whose <sock>.fp is sha256(RVN_URL || PGSYNC_URL)[:16] (the rule of
+//     digital-twin's neon-holder-fp.cjs: never a holder of another database), and <sock>.pid is not this process
+//     (the holder itself loads this module: it never asks itself);
+//   - the init asks for the plain default model (no modelId, maxLength, normalize, cacheDir, identity override,
+//     parallel workers): anything else loads locally, as before;
+//   - RUVECTOR_EMBED_HOLDER and EMBED_SHARED are not '0'.
+// Whenever the holder is absent, refuses, answers an error, an unusable identity or a malformed vector, or does not
+// answer within RUVECTOR_EMBED_HOLDER_TIMEOUT_MS (default 5000), the model loads locally exactly as before, for good
+// in this process. Never the hash fallback. similarity() and the parallel pool always need the local model.
+let holderSock: string | null = null;   // embeds go to this holder while set
+let holderOff = false;                  // the holder failed once: local from now on
+let holderEmbeds = 0;
+
+function holderTimeoutMs(): number {
+  const n = Number(process.env.RUVECTOR_EMBED_HOLDER_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 5000;
+}
+
+/** The holder socket serving this process's database, or null (same fingerprint rule as neon-holder-fp.cjs). */
+export function embedHolderSocket(env: NodeJS.ProcessEnv = process.env): string | null {
+  if (env.RUVECTOR_EMBED_HOLDER === '0' || env.EMBED_SHARED === '0') return null;
+  const sock = env.NEON_HOLDER_SOCK;
+  const url = env.RVN_URL || env.PGSYNC_URL;
+  if (!sock || !url) return null;
+  try {
+    if (!fs.existsSync(sock)) return null;
+    const fp = createHash('sha256').update(String(url)).digest('hex').slice(0, 16);
+    if (fs.readFileSync(`${sock}.fp`, 'utf8').trim() !== fp) return null;
+  } catch {
+    return null;
+  }
+  try {
+    if (fs.readFileSync(`${sock}.pid`, 'utf8').trim() === String(process.pid)) return null;
+  } catch {
+    /* no pid file: not this process */
+  }
+  return sock;
+}
+
+function askHolder(sock: string, msg: Record<string, unknown>): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let buf = '';
+    let done = false;
+    const c = net.connect(sock);
+    const finish = (err: Error | null, value?: any) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      c.destroy();
+      if (err) reject(err); else resolve(value);
+    };
+    const timer = setTimeout(() => finish(new Error('holder timeout')), holderTimeoutMs());
+    c.setEncoding('utf8');
+    c.on('connect', () => c.write(JSON.stringify({ id: 1, ...msg }) + '\n'));
+    c.on('data', (d: string) => {
+      buf += d;
+      const i = buf.indexOf('\n');
+      if (i < 0) return;
+      let r: any;
+      try { r = JSON.parse(buf.slice(0, i)); } catch (e: any) { return finish(e); }
+      if (r && r.error) finish(new Error(String(r.error))); else finish(null, r);
+    });
+    c.on('error', (e: Error) => finish(e));
+    c.on('close', () => finish(new Error('holder closed the connection')));
+  });
+}
+
+function isDefaultOnnxConfig(config: OnnxEmbedderConfig): boolean {
+  for (const [key, value] of Object.entries(config || {})) {
+    if (value === undefined) continue;
+    if (key === 'enableParallel' && (value === false || value === 'auto')) continue;
+    return false;
+  }
+  return true;
+}
+
+/** Initialise from the holder: true when every embed of this process can go there. */
+async function initFromHolder(sock: string): Promise<boolean> {
+  try {
+    const r = await askHolder(sock, { kind: 'embed', fn: 'identity' });
+    const id = r && r.identity;
+    if (!r || r.ready !== true || r.dim !== 384 || r.modelId !== DEFAULT_MODEL || !id) return false;
+    assertEmbeddingSpaceIdentity(id);
+    if (id.model_id !== DEFAULT_MODEL || id.output_dimension !== 384 || id.normalize !== true
+      || id.provider !== 'ruvector-onnx-wasm' || id.prefix_policy !== requireModelPrefixSpec(DEFAULT_MODEL).prefixPolicy) return false;
+    loadedModelId = DEFAULT_MODEL;
+    loadedNormalize = true;
+    loadedMaxLength = id.truncation_tokens;
+    loadedEmbeddingSpaceIdentity = id;
+    holderSock = sock;
+    isInitialized = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Load the model in this process (the holder failed, or the caller needs the local model). */
+async function ensureLocalEmbedder(): Promise<void> {
+  holderOff = true;
+  if (embedder) return;
+  if (holderSock) {
+    holderSock = null;
+    isInitialized = false;
+    loadPromise = null;
+  }
+  await initOnnxEmbedder();
+}
+
+const isVector = (v: any): boolean =>
+  Array.isArray(v) && v.length === 384 && v.every((x: any) => typeof x === 'number' && Number.isFinite(x));
+
+/** Where this process's embeddings come from: 'holder', 'local', or null before init. */
+export function getEmbedderVia(): 'holder' | 'local' | null {
+  return holderSock ? 'holder' : embedder ? 'local' : null;
+}
+
+/** Embeds this process sent to the holder. */
+export function getHolderEmbedCount(): number {
+  return holderEmbeds;
+}
 
 export function deriveOnnxEmbeddingSpaceIdentity(
   modelId: string,
@@ -264,6 +393,12 @@ export async function initOnnxEmbedder(config: OnnxEmbedderConfig = {}): Promise
   }
 
   loadPromise = (async () => {
+    // neon-direct: the holder's model, for the plain default model only (see embedHolderSocket above)
+    if (!holderOff && isDefaultOnnxConfig(config) && !wantsParallel(config)) {
+      const sock = embedHolderSocket();
+      if (sock && await initFromHolder(sock)) return;
+      holderOff = true;
+    }
     try {
       // Paths to bundled ONNX files
       const bgJsPath = path.join(__dirname, 'onnx', 'pkg', 'ruvector_onnx_embeddings_wasm_bg.js');
@@ -357,25 +492,7 @@ export async function initOnnxEmbedder(config: OnnxEmbedderConfig = {}): Promise
       // - true: always enable
       // - false: never enable
       // - 'auto'/undefined: enable for long-running processes (MCP, servers), skip for CLI
-      let shouldTryParallel = false;
-      if (config.enableParallel === true) {
-        shouldTryParallel = true;
-      } else if (config.enableParallel === false) {
-        shouldTryParallel = false;
-      } else {
-        // Auto-detect: check if running as CLI hook or long-running process
-        const isCLI = process.argv[1]?.includes('cli.js') ||
-                      process.argv[1]?.includes('bin/ruvector') ||
-                      process.env.RUVECTOR_CLI === '1';
-        const isMCP = process.env.MCP_SERVER === '1' ||
-                      process.argv.some(a => a.includes('mcp'));
-        const forceParallel = process.env.RUVECTOR_PARALLEL === '1';
-
-        // Enable parallel for MCP/servers or if explicitly requested, skip for CLI
-        shouldTryParallel = forceParallel || (isMCP && !isCLI);
-      }
-
-      if (shouldTryParallel) {
+      if (wantsParallel(config)) {
         await tryInitParallel(config);
       }
     } catch (e: any) {
@@ -388,9 +505,40 @@ export async function initOnnxEmbedder(config: OnnxEmbedderConfig = {}): Promise
   return isInitialized;
 }
 
+/**
+ * Whether init starts parallel workers: true always, false never; 'auto'/undefined: for long-running processes
+ * (MCP, servers) or RUVECTOR_PARALLEL=1, skipped for the CLI.
+ */
+function wantsParallel(config: OnnxEmbedderConfig): boolean {
+  if (config.enableParallel === true) return true;
+  if (config.enableParallel === false) return false;
+  // Auto-detect: check if running as CLI hook or long-running process
+  const isCLI = process.argv[1]?.includes('cli.js') ||
+                process.argv[1]?.includes('bin/ruvector') ||
+                process.env.RUVECTOR_CLI === '1';
+  const isMCP = process.env.MCP_SERVER === '1' ||
+                process.argv.some(a => a.includes('mcp'));
+  const forceParallel = process.env.RUVECTOR_PARALLEL === '1';
+  // Enable parallel for MCP/servers or if explicitly requested, skip for CLI
+  return forceParallel || (isMCP && !isCLI);
+}
+
 async function embedKind(kind: EmbedTextKind, text: string): Promise<EmbeddingResult> {
   if (!isInitialized) {
     await initOnnxEmbedder();
+  }
+  if (holderSock) {
+    try {
+      const r = await askHolder(holderSock, { kind: 'embed', fn: kind === 'query' ? 'embedQuery' : 'embedPassage', args: [text] });
+      const v = r && r.result;
+      if (v && isVector(v.embedding)) {
+        holderEmbeds++;
+        return { embedding: v.embedding, dimension: v.embedding.length, timeMs: Number(v.timeMs) || 0 };
+      }
+    } catch {
+      /* the holder went away: local from now on */
+    }
+    await ensureLocalEmbedder();
   }
   if (!embedder) {
     throw new Error('ONNX embedder not initialized');
@@ -455,6 +603,19 @@ export async function embedBatchFor(kind: EmbedTextKind, texts: string[]): Promi
   if (!isInitialized) {
     await initOnnxEmbedder();
   }
+  if (holderSock) {
+    try {
+      const r = await askHolder(holderSock, { kind: 'embed', fn: kind === 'query' ? 'embedQueryBatch' : 'embedPassageBatch', args: [texts] });
+      const v = r && r.result;
+      if (Array.isArray(v) && v.length === texts.length && v.every((x: any) => x && isVector(x.embedding))) {
+        holderEmbeds++;
+        return v.map((x: any) => ({ embedding: x.embedding, dimension: x.embedding.length, timeMs: Number(x.timeMs) || 0 }));
+      }
+    } catch {
+      /* the holder went away: local from now on */
+    }
+    await ensureLocalEmbedder();
+  }
   if (!embedder) {
     throw new Error('ONNX embedder not initialized');
   }
@@ -503,6 +664,7 @@ export async function similarity(text1: string, text2: string): Promise<Similari
   if (!isInitialized) {
     await initOnnxEmbedder();
   }
+  if (holderSock) await ensureLocalEmbedder();   // the WASM similarity needs the local model
   if (!embedder) {
     throw new Error('ONNX embedder not initialized');
   }
@@ -644,6 +806,7 @@ export async function shutdown(): Promise<void> {
 export async function initParallelEmbedder(numWorkers?: number): Promise<boolean> {
   if (bundledPool) return true;
   if (!isInitialized) await initOnnxEmbedder();
+  if (holderSock) await ensureLocalEmbedder();   // the pool shares the local model bytes
   if (!loadedModelBytes || !loadedTokenizerJson) {
     throw new Error('Model bytes unavailable; cannot start parallel embedder.');
   }
